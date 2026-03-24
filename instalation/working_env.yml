@@ -1,0 +1,32 @@
+name: work311n
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - scyjava
+  - tifffile
+  - dask
+  - matplotlib
+  - pandas
+  - ome-zarr
+  - imagecodecs
+  - openjdk=17
+  - readlif
+  - python=3.11
+  - scipy
+  - ome-types
+  - distributed
+  - tqdm
+  - h5py
+  - pillow
+  - scikit-image
+  - skan
+  - opencv
+  - pyside6
+  - napari
+  - pip
+  - pip:
+    - bioio
+    - bioio_bioformats
+    - bioio_ome_zarr
+prefix: /Users/tom/miniforge3/envs/work311n
