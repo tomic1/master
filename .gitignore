@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Notebook
+.ipynb_checkpoints/
+
+# Environments
+.conda/
+.venv/
+venv/
+
+# OS/Editor
+.DS_Store
+.vscode/
+
+# Large/generated analysis artifacts
+data/
+plots/
+*_test.ipynb
+*.zarr/
+*.h5
+*.hdf5
+*.tif
+*.tiff
+*.vsi
+*.lif
+*.mp4
+
+# Logs and cache
+*.log
+cache/

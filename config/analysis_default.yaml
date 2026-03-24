@@ -1,0 +1,42 @@
+dataset:
+  base_dir: "/Volumes/TOM_DATA"
+  dataset_id: "AMF_101_003__C640_C470"
+  variation: ""
+  sampling: 1
+  tstop: -1
+  xy_cut: 0.0
+  z_lower: 0
+  z_upper: null
+  load_mask_channel: true
+
+beads:
+  enabled: true
+  channel_to_use: 1
+  min_size_voxels: 5
+  max_bbox_ratio: 5.0
+  max_inertia_ratio: 3.0
+  search_range_um: 10.0
+  memory: 1
+  min_track_length: 0
+  threshold_samples: 10
+  compute_angular_speed: true
+  origin_x_um: null
+  origin_y_um: null
+
+autocorr:
+  enabled: true
+  channel_3d: 0
+  single_frame_3d: 0
+  sample_count_3d: 10
+  sample_count_2d: 20
+  middle_z_for_2d: "middle"
+  frame_2d: 0
+  channel_2d: 0
+  nbins: 120
+  subtract_mean: false
+  normalize: "c0"
+
+runtime:
+  skip_existing: true
+  save_preview_masks: false
+  verbose: true
