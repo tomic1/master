@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import os
 from typing import Any, Dict, List
 
@@ -44,6 +45,81 @@ def _fit_decay(r_um: np.ndarray, corr: np.ndarray) -> Dict[str, float]:
         return {"xi_um": np.nan, "xi_err_um": np.nan}
 
 
+def _resolve_parallel_workers(requested_workers: Any, task_count: int) -> int:
+    task_count = max(0, int(task_count))
+    if task_count <= 1:
+        return 1
+
+    try:
+        workers = int(requested_workers)
+    except Exception:
+        workers = 0
+
+    if workers <= 0:
+        return 1
+
+    return max(1, min(workers, task_count))
+
+
+def _parallel_map(worker_fn, items, max_workers: int, desc: str | None = None):
+    items = list(items)
+    if len(items) <= 1 or int(max_workers) <= 1:
+        return [worker_fn(item) for item in items]
+
+    with ThreadPoolExecutor(max_workers=int(max_workers)) as executor:
+        iterator = executor.map(worker_fn, items)
+        if desc:
+            iterator = tqdm(iterator, total=len(items), desc=desc)
+        return list(iterator)
+
+
+def _sampled_2d_frame_rows(args):
+    (
+        images,
+        dataset_id,
+        fr,
+        channel,
+        z_idx,
+        nbins,
+        subtract_mean,
+        normalize,
+        px_xy,
+        time_step_s,
+    ) = args
+
+    img = images[int(fr), channel, int(z_idx)].compute()
+    img = np.asarray(img)
+    if img.ndim != 2:
+        return []
+
+    r_um, corr_prof = mass_mass_corr_per_frame(
+        imgs=img[np.newaxis, ...],
+        px_per_micron=px_xy,
+        px_per_micron_z=px_xy,
+        nbins=nbins,
+        subtract_mean=subtract_mean,
+        normalize=normalize,
+    )
+    corr = np.asarray(corr_prof, dtype=float)[0]
+    r = np.asarray(r_um, dtype=float)
+    fit = _fit_decay(r, corr)
+
+    return [
+        {
+            "dataset_id": dataset_id,
+            "frame": int(fr),
+            "time_s": float(fr) * float(time_step_s),
+            "z_index": int(z_idx),
+            "channel": int(channel),
+            "r_um": float(ri),
+            "corr": float(ci),
+            "xi_um": fit.get("xi_um", np.nan),
+            "xi_err_um": fit.get("xi_err_um", np.nan),
+        }
+        for ri, ci in zip(r.tolist(), corr.tolist())
+    ]
+
+
 def compute_sampled_2d(state: Dict[str, Any], autocorr_cfg: Dict[str, Any], skip_existing: bool = True) -> pd.DataFrame:
     derived_dir = state["paths"]["derived_dir"]
     out_path = os.path.join(derived_dir, "autocorr_2d_sampled.parquet")
@@ -63,6 +139,7 @@ def compute_sampled_2d(state: Dict[str, Any], autocorr_cfg: Dict[str, Any], skip
 
     sample_count = min(max(1, int(autocorr_cfg.get("sample_count_2d", 20))), t_len)
     frames = np.unique(np.linspace(0, max(t_len - 1, 0), sample_count, dtype=int))
+    parallel_workers = _resolve_parallel_workers(autocorr_cfg.get("parallel_workers", 0), len(frames))
 
     px_xy = float(state["calibration"]["px_per_micron"])
     fps = state["calibration"].get("fps")
@@ -74,40 +151,23 @@ def compute_sampled_2d(state: Dict[str, Any], autocorr_cfg: Dict[str, Any], skip
     else:
         z_idx = int(z_mode)
 
-    rows: List[Dict[str, Any]] = []
-
-    for fr in tqdm(frames, desc="sampled 2d autocorr"):
-        img = images[int(fr), channel, int(z_idx)].compute()
-        img = np.asarray(img)
-        if img.ndim != 2:
-            continue
-
-        r_um, corr_prof = mass_mass_corr_per_frame(
-            imgs=img[np.newaxis, ...],
-            px_per_micron=px_xy,
-            px_per_micron_z=px_xy,
-            nbins=nbins,
-            subtract_mean=subtract_mean,
-            normalize=normalize,
+    jobs = [
+        (
+            images,
+            state["dataset_id"],
+            int(fr),
+            int(channel),
+            int(z_idx),
+            int(nbins),
+            bool(subtract_mean),
+            normalize,
+            px_xy,
+            time_step_s,
         )
-        corr = np.asarray(corr_prof, dtype=float)[0]
-        r = np.asarray(r_um, dtype=float)
-        fit = _fit_decay(r, corr)
-
-        for ri, ci in zip(r.tolist(), corr.tolist()):
-            rows.append(
-                {
-                    "dataset_id": state["dataset_id"],
-                    "frame": int(fr),
-                    "time_s": float(fr) * float(time_step_s),
-                    "z_index": int(z_idx),
-                    "channel": int(channel),
-                    "r_um": float(ri),
-                    "corr": float(ci),
-                    "xi_um": fit.get("xi_um", np.nan),
-                    "xi_err_um": fit.get("xi_err_um", np.nan),
-                }
-            )
+        for fr in frames
+    ]
+    rows_nested = _parallel_map(_sampled_2d_frame_rows, jobs, parallel_workers, desc="sampled 2d autocorr")
+    rows: List[Dict[str, Any]] = [row for rows_per_frame in rows_nested for row in rows_per_frame]
 
     out_df = pd.DataFrame(rows)
     out_df.to_parquet(out_path, index=False)

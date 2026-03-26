@@ -1,0 +1,67 @@
+# Set color cycle: blue, green, yellow, red, violet, gray
+axes.prop_cycle : cycler('color', ['0C5DA5', '00B945', 'FF9500', 'FF2C00', '845B97', '474747', '9e9e9e', 'bad61a'])
+
+# Set default figure size
+# figure.figsize : 8, 8
+
+# Set x axis
+xtick.direction : in
+xtick.major.size : 3.5
+xtick.major.width : 0.7
+xtick.minor.size : 2
+xtick.minor.width : 0.5
+xtick.minor.visible : True
+xtick.top : True
+
+#Setup Grid
+axes.grid : True
+axes.axisbelow : True
+axes.xmargin : 1
+axes.ymargin: 1
+#axes.unicode_minus : False
+
+# Set y axis
+ytick.direction : in
+ytick.major.size : 3.5
+ytick.major.width : 0.7
+ytick.minor.size : 2
+ytick.minor.width : 0.5
+ytick.minor.visible : True
+ytick.right : True
+
+# Set line widths
+axes.linewidth : 0.5
+grid.linewidth : 0.5
+grid.alpha : 0.7
+lines.linewidth : 1.
+
+# Remove legend frame
+legend.frameon : False
+
+# Always save as 'tight'
+savefig.bbox : tight
+savefig.pad_inches : 0.05
+
+# Use LaTex fonts
+font.serif : computer modern unicode
+font.family : serif
+font.size : 2
+#font.weight		:	normal
+#font.style		:	normal
+#font.variant		:	normal
+#mathtext.fontset	:	cm
+#mathtext.rm : serif
+#mathtext.fallback_to_cm : True
+#axes.formatter.use_mathtext : True
+legend.fontsize	:	11
+legend.title_fontsize : 11
+axes.titlesize		:   11
+axes.labelsize	:	11
+xtick.labelsize	:	11
+ytick.labelsize	:	11
+axes.labelweight	:	normal
+axes.titleweight	:	normal
+figure.titlesize	:	11
+
+# Use LaTeX for math formatting
+text.usetex : True

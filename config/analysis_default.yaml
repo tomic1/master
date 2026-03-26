@@ -13,11 +13,11 @@ beads:
   enabled: true
   channel_to_use: 1
   min_size_voxels: 5
-  max_bbox_ratio: 5.0
-  max_inertia_ratio: 3.0
-  search_range_um: 10.0
-  memory: 1
-  min_track_length: 0
+  max_bbox_ratio: 6.0
+  max_inertia_ratio: 6.0
+  search_range_um: 15.0
+  memory: 2
+  min_track_length: 2
   threshold_samples: 10
   compute_angular_speed: true
   origin_x_um: null

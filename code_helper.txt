@@ -1,0 +1,1 @@
+python embed_existing_zarr.py /Volumes/dataserver_files/Group_Bausch/Tom_Dataserver/20260311/20260311_AMF_095_002.zarr --source-path /Volumes/dataserver_files/Group_Bausch/Tom_Dataserver/20260311/AMF_095_002.vsi --output-root "/Volumes/dataserver_files/Group_Bausch/Tom_Dataserver/20260311"  --overwrite --embed-data

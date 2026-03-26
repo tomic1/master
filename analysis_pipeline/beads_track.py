@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import inspect
 import os
 from typing import Any, Dict
@@ -24,6 +25,104 @@ def _remove_small_objects_compat(ar: np.ndarray, min_size: int) -> np.ndarray:
     return remove_small_objects(ar, min_size=min_size)
 
 
+def _resolve_parallel_workers(requested_workers: Any, task_count: int) -> int:
+    task_count = max(0, int(task_count))
+    if task_count <= 1:
+        return 1
+
+    try:
+        workers = int(requested_workers)
+    except Exception:
+        workers = 0
+
+    if workers <= 0:
+        return 1
+
+    return max(1, min(workers, task_count))
+
+
+def _parallel_map(worker_fn, items, max_workers: int, desc: str | None = None):
+    items = list(items)
+    if len(items) <= 1 or int(max_workers) <= 1:
+        return [worker_fn(item) for item in items]
+
+    with ThreadPoolExecutor(max_workers=int(max_workers)) as executor:
+        iterator = executor.map(worker_fn, items)
+        if desc:
+            iterator = tqdm(iterator, total=len(items), desc=desc)
+        return list(iterator)
+
+
+def _threshold_for_frame(args) -> float:
+    images, ti_s, channel_to_use = args
+    vol_full = images[ti_s, channel_to_use].compute()
+    try:
+        return float(threshold_beads(vol_full))
+    except Exception:
+        return float(np.mean(vol_full))
+
+
+def _detect_frame_detections(args):
+    (
+        images,
+        ti,
+        channel_to_use,
+        thr,
+        min_size_voxels,
+        max_bbox_ratio,
+        max_inertia_ratio,
+        dataset_id,
+    ) = args
+
+    raw_vol = images[ti, channel_to_use].compute()
+    binary = raw_vol.astype(np.float32) > float(thr)
+    binary = _remove_small_objects_compat(binary, int(min_size_voxels))
+
+    lab = label(binary, connectivity=1)
+    props = regionprops(lab, intensity_image=raw_vol)
+
+    rows = []
+    for p in props:
+        if p.area < min_size_voxels:
+            continue
+
+        min_z, min_y, min_x, max_z, max_y, max_x = p.bbox
+        dz, dy, dx = (max_z - min_z), (max_y - min_y), (max_x - min_x)
+        if min(dz, dy, dx) <= 0:
+            continue
+        bbox_ratio = max(dz, dy, dx) / min(dz, dy, dx)
+        if bbox_ratio > max_bbox_ratio:
+            continue
+
+        try:
+            eig = np.asarray(p.inertia_tensor_eigvals, dtype=float)
+        except Exception:
+            eig = np.linalg.eigvalsh(p.inertia_tensor).astype(float)
+        if np.any(eig <= 0):
+            continue
+        inertia_ratio = float(eig.max() / eig.min())
+        if inertia_ratio > max_inertia_ratio:
+            continue
+
+        cz, cy, cx = p.centroid
+        rows.append(
+            {
+                "dataset_id": dataset_id,
+                "frame": int(ti),
+                "z": float(cz),
+                "y": float(cy),
+                "x": float(cx),
+                "area_vox": int(p.area),
+                "mean_intensity": float(getattr(p, "mean_intensity", np.nan)),
+                "max_intensity": float(getattr(p, "max_intensity", np.nan)),
+                "bbox_ratio": float(bbox_ratio),
+                "inertia_ratio": float(inertia_ratio),
+            }
+        )
+
+    return rows
+
+
 def _interpolated_thresholds(images, channel_to_use: int, n_samples: int) -> np.ndarray:
     t_len = int(images.shape[0])
     if t_len < 1:
@@ -31,14 +130,16 @@ def _interpolated_thresholds(images, channel_to_use: int, n_samples: int) -> np.
 
     n_samples = min(max(1, int(n_samples)), t_len)
     sample_idx = np.linspace(0, t_len - 1, n_samples, dtype=int)
-    measured = np.zeros(len(sample_idx), dtype=float)
-
-    for i, ti_s in enumerate(sample_idx):
-        vol_full = images[ti_s, channel_to_use].compute()
-        try:
-            measured[i] = threshold_beads(vol_full)
-        except Exception:
-            measured[i] = float(np.mean(vol_full))
+    workers = _resolve_parallel_workers(None, len(sample_idx))
+    measured = np.asarray(
+        _parallel_map(
+            _threshold_for_frame,
+            [(images, int(ti_s), int(channel_to_use)) for ti_s in sample_idx],
+            workers,
+            desc="threshold samples",
+        ),
+        dtype=float,
+    )
 
     thresholds = np.interp(np.arange(t_len), sample_idx, measured).astype(float)
     thresholds_next = np.empty_like(thresholds)
@@ -151,56 +252,24 @@ def detect_and_link_beads(state: Dict[str, Any], beads_cfg: Dict[str, Any], skip
     memory = int(beads_cfg.get("memory", 1))
     min_track_length = int(beads_cfg.get("min_track_length", 0))
     threshold_samples = int(beads_cfg.get("threshold_samples", 10))
+    parallel_workers = _resolve_parallel_workers(beads_cfg.get("parallel_workers", 0), t_len)
 
     thresholds_next = _interpolated_thresholds(images, channel_to_use, threshold_samples)
-    detections = []
-
-    for ti in tqdm(range(t_len), desc="detect beads"):
-        raw_vol = images[ti, channel_to_use].compute()
-        thr = float(thresholds_next[ti])
-        binary = raw_vol.astype(np.float32) > thr
-        binary = _remove_small_objects_compat(binary, min_size_voxels)
-
-        lab = label(binary, connectivity=1)
-        props = regionprops(lab, intensity_image=raw_vol)
-
-        for p in props:
-            if p.area < min_size_voxels:
-                continue
-
-            min_z, min_y, min_x, max_z, max_y, max_x = p.bbox
-            dz, dy, dx = (max_z - min_z), (max_y - min_y), (max_x - min_x)
-            if min(dz, dy, dx) <= 0:
-                continue
-            bbox_ratio = max(dz, dy, dx) / min(dz, dy, dx)
-            if bbox_ratio > max_bbox_ratio:
-                continue
-
-            try:
-                eig = np.asarray(p.inertia_tensor_eigvals, dtype=float)
-            except Exception:
-                eig = np.linalg.eigvalsh(p.inertia_tensor).astype(float)
-            if np.any(eig <= 0):
-                continue
-            inertia_ratio = float(eig.max() / eig.min())
-            if inertia_ratio > max_inertia_ratio:
-                continue
-
-            cz, cy, cx = p.centroid
-            detections.append(
-                {
-                    "dataset_id": dataset_id,
-                    "frame": int(ti),
-                    "z": float(cz),
-                    "y": float(cy),
-                    "x": float(cx),
-                    "area_vox": int(p.area),
-                    "mean_intensity": float(getattr(p, "mean_intensity", np.nan)),
-                    "max_intensity": float(getattr(p, "max_intensity", np.nan)),
-                    "bbox_ratio": float(bbox_ratio),
-                    "inertia_ratio": float(inertia_ratio),
-                }
-            )
+    jobs = [
+        (
+            images,
+            int(ti),
+            channel_to_use,
+            float(thresholds_next[ti]),
+            min_size_voxels,
+            max_bbox_ratio,
+            max_inertia_ratio,
+            dataset_id,
+        )
+        for ti in range(t_len)
+    ]
+    detections_nested = _parallel_map(_detect_frame_detections, jobs, parallel_workers, desc="detect beads")
+    detections = [row for rows in detections_nested for row in rows]
 
     detections_df = pd.DataFrame(detections)
     if len(detections_df) == 0:

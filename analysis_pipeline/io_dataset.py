@@ -89,12 +89,26 @@ def load_dataset_state(dataset_cfg: Dict[str, Any], verbose: bool = True) -> Dic
 
     if verbose:
         raw_mb = float(np.prod(images.shape) * images.dtype.itemsize / (1024**2))
+        meta = handle.get("meta", {}) if isinstance(handle, dict) else {}
+        source_name = meta.get("name", dataset_id)
+        channels = int(images.shape[1])
+        px_xy_str = f"{float(px_per_micron):.4g}" if px_per_micron else "n/a"
+        px_z_str = f"{float(px_per_micron_z):.4g}" if px_per_micron_z else "n/a"
+        fps_str = f"{float(fps):.4g}" if fps else "n/a"
         print(
             "Loaded dataset"
-            f" | id={dataset_id}"
-            f" | shape={tuple(images.shape)}"
-            f" | chunks={images.chunksize}"
-            f" | size_gb={raw_mb/1000.0:.2f}"
+            f"\n  id: {dataset_id}"
+            f"\n  name: {source_name}"
+            f"\n  variation: {variation or '-'}"
+            f"\n  base_dir: {base_dir}"
+            f"\n  shape (T,C,Z,Y,X): {tuple(images.shape)}"
+            f"\n  chunks: {images.chunksize}"
+            f"\n  size_gb: {raw_mb/1000.0:.2f}"
+            f"\n  channels: {channels}"
+            f"\n  px_per_micron: {px_xy_str}"
+            f"\n  px_per_micron_z: {px_z_str}"
+            f"\n  fps: {fps_str}"
+            f"\n  mask channel loaded: {bool(raw_mask is not None)}"
         )
 
     return state

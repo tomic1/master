@@ -18,13 +18,14 @@ def run_bead_core(config: Dict[str, Any], overrides: Dict[str, Any] | None = Non
     state = load_dataset_state(cfg["dataset"], verbose=bool(runtime.get("verbose", True)))
     beads_cfg = cfg.get("beads", {})
     skip_existing = bool(runtime.get("skip_existing", True))
+    angular_mode = bool(beads_cfg.get("angular_mode", False))
 
     preview_summary, preview_stats, _, _ = preview_bead_detection(state, beads_cfg, show=True)
     detections_df, tracks_df = detect_and_link_beads(state, beads_cfg, skip_existing=skip_existing)
     vel_df = compute_velocity_from_tracks(state, tracks_df, skip_existing=skip_existing)
 
     ang_df = None
-    if bool(beads_cfg.get("compute_angular_speed", True)) and len(vel_df) > 0:
+    if angular_mode and bool(beads_cfg.get("compute_angular_speed", True)) and len(vel_df) > 0:
         ang_df = compute_angular_speed_xy(state, vel_df, beads_cfg, skip_existing=skip_existing)
 
     return {
