@@ -62,6 +62,15 @@ def _default_config() -> Dict[str, Any]:
             "save_preview_masks": False,
             "verbose": True,
         },
+        "comparison": {
+            "enabled": False,
+            "name": "concentration_comparison",
+            "palette": "atp",
+            "output_root": "plots/comparisons",
+            "groups": [],
+            "share_axes": True,
+            "show_distribution_stats": True,
+        },
     }
 
 
