@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from matplotlib import cm
 import matplotlib.pyplot as plt
@@ -19,8 +19,8 @@ ATP_COMPARISON_COLORS = (
 
 PRC_COMPARISON_COLORS = (
     "#a6dba0",
-    "#41ab5d",
-    "#238b45",
+    "#5aae61",
+    "#1b7837",
     "#00441b",
 )
 
@@ -31,6 +31,7 @@ class ComparisonSpec:
     label: str
     color: str
     group: str = ""
+    replicate: str = ""
     variation: str = ""
     base_dir: str | None = None
 
@@ -51,7 +52,28 @@ def comparison_palette(kind: str, n: int) -> list[str]:
         return _resample_palette(ATP_COMPARISON_COLORS, n)
     if kind_norm in {"prc", "green", "g"}:
         return _resample_palette(PRC_COMPARISON_COLORS, n)
-    return _resample_palette(cm.get_cmap("tab10").colors, n)
+    cmap = cm.get_cmap("tab10")
+    if n <= 0:
+        return []
+    if n == 1:
+        return [to_hex(cmap(0.0))]
+    samples = np.linspace(0.0, 1.0, n)
+    return [to_hex(cmap(value)) for value in samples]
+
+
+def comparison_legend_kwargs(fig) -> dict[str, float]:
+    width, height = fig.get_size_inches()
+    base = min(float(width), float(height))
+    fontsize = max(10, min(16, int(round(base * 1.4))))
+    return {
+        "fontsize": fontsize,
+        "title_fontsize": fontsize,
+        "handlelength": 2.2,
+        "labelspacing": 0.6,
+        "borderpad": 0.8,
+        "handletextpad": 0.7,
+        "columnspacing": 1.2,
+    }
 
 
 def comparison_specs_from_config(comparison_cfg: dict[str, Any]) -> list[ComparisonSpec]:
@@ -61,15 +83,26 @@ def comparison_specs_from_config(comparison_cfg: dict[str, Any]) -> list[Compari
     ``datasets`` field. Grouped entries inherit the group palette and variation unless a
     child dataset overrides them.
     """
-    if not comparison_cfg.get("enabled", False):
-        return []
+    return comparison_registry_from_config(comparison_cfg)
 
-    groups = list(comparison_cfg.get("groups", []))
-    if not groups:
+
+def comparison_registry_from_config(comparison_cfg: dict[str, Any]) -> list[ComparisonSpec]:
+    if not comparison_cfg.get("enabled", False):
         return []
 
     default_palette = str(comparison_cfg.get("palette", "atp"))
     default_variation = str(comparison_cfg.get("variation", "")).strip()
+    registry = comparison_cfg.get("registry")
+    if registry:
+        return build_comparison_specs(registry, palette=default_palette)
+
+    groups = list(comparison_cfg.get("groups", []))
+    if not groups:
+        datasets = comparison_cfg.get("datasets")
+        if datasets:
+            return build_comparison_specs(datasets, palette=default_palette)
+        return []
+
     flat_entries: list[dict[str, Any] | Sequence[Any]] = []
 
     for group in groups:
@@ -86,6 +119,7 @@ def comparison_specs_from_config(comparison_cfg: dict[str, Any]) -> list[Compari
         group_palette = str(group.get("palette", default_palette)).strip() or default_palette
         group_variation = str(group.get("variation", default_variation)).strip()
         group_base_dir = group.get("base_dir")
+        group_replicate = str(group.get("replicate", "")).strip()
 
         specs = build_comparison_specs(datasets, palette=group_palette)
         for spec in specs:
@@ -95,6 +129,7 @@ def comparison_specs_from_config(comparison_cfg: dict[str, Any]) -> list[Compari
                     "label": spec.label,
                     "color": spec.color,
                     "group": group_name or spec.group,
+                    "replicate": spec.replicate or group_replicate,
                     "variation": spec.variation or group_variation,
                     "base_dir": spec.base_dir if spec.base_dir is not None else group_base_dir,
                 }
@@ -124,6 +159,7 @@ def build_comparison_specs(
                     label=label,
                     color=color,
                     group=str(entry.get("group", "")).strip(),
+                    replicate=str(entry.get("replicate", "")).strip(),
                     variation=str(entry.get("variation", "")).strip(),
                     base_dir=entry.get("base_dir"),
                 )
@@ -149,6 +185,7 @@ def build_comparison_specs(
                 label=label,
                 color=color,
                 group=group,
+                replicate="",
                 variation=variation,
                 base_dir=base_dir,
             )
@@ -157,7 +194,37 @@ def build_comparison_specs(
     return specs
 
 
-def comparison_style_context(background: str = "dark"):
+def save_comparison_dual_pdf(
+    fig,
+    output_dir: str | Path,
+    stem: str,
+    *,
+    white_plot_fn: Callable[[Any], None] | None = None,
+    dpi: int = 150,
+) -> dict[str, Path]:
+    """Save a comparison figure as matching black and white PDFs.
+
+    The provided figure is written as the black presentation version. If ``white_plot_fn``
+    is given, it is used to redraw the figure on a white background and that version is
+    saved without a title.
+    """
+    paths = comparison_export_paths(output_dir, stem)
+    fig.savefig(str(paths["black"]), dpi=dpi, bbox_inches="tight")
+
+    if white_plot_fn is None:
+        return paths
+
+    with comparison_style_context("white"):
+        fig_white, ax_white = plt.subplots(figsize=fig.get_size_inches(), dpi=dpi)
+        white_plot_fn(ax_white)
+        ax_white.set_title("")
+        fig_white.savefig(str(paths["white"]), dpi=dpi, bbox_inches="tight")
+        plt.close(fig_white)
+
+    return paths
+
+
+def comparison_style_context(background: str = "dark") -> Any:
     background_norm = str(background).strip().lower()
     base_style: list[Any] = ["./science.mplstyle.txt"]
     if background_norm == "white":

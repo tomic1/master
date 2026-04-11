@@ -8,6 +8,7 @@ from .autocorr_2d import compute_radial_2d_single, compute_sampled_2d
 from .autocorr_3d import compute_sampled_3d, compute_single_frame_3d
 from .beads_track import detect_and_link_beads, preview_bead_detection
 from .beads_velocity import compute_angular_speed_xy, compute_velocity_from_tracks
+from .image_correlation import compute_raw_time_image_correlation, fit_time_image_correlation
 from .io_dataset import load_dataset_state
 
 
@@ -62,12 +63,66 @@ def run_autocorr_core(config: Dict[str, Any], state: Dict[str, Any] | None = Non
     }
 
 
+def run_image_correlation_core(config: Dict[str, Any], state: Dict[str, Any] | None = None, overrides: Dict[str, Any] | None = None) -> Dict[str, pd.DataFrame]:
+    cfg = config if overrides is None else _merge_runtime(config, overrides)
+    runtime = cfg.get("runtime", {})
+    skip_existing = bool(runtime.get("skip_existing", True))
+    image_corr_cfg = dict(cfg.get("autocorr", {}))
+    image_corr_cfg.update(cfg.get("image_corr", {}))
+
+    if not bool(image_corr_cfg.get("enabled", True)):
+        return {"image_corr_df": pd.DataFrame()}
+
+    if state is None:
+        state = load_dataset_state(cfg["dataset"], verbose=bool(runtime.get("verbose", True)))
+
+    image_corr_df = compute_raw_time_image_correlation(state, image_corr_cfg, skip_existing=skip_existing)
+
+    return {"image_corr_df": image_corr_df}
+
+
+def run_image_correlation_fit_core(
+    config: Dict[str, Any],
+    state: Dict[str, Any] | None = None,
+    raw_df: pd.DataFrame | None = None,
+    fit_selection: Dict[str, Any] | None = None,
+    skip_existing: bool | None = None,
+    overrides: Dict[str, Any] | None = None,
+) -> Dict[str, pd.DataFrame]:
+    cfg = config if overrides is None else _merge_runtime(config, overrides)
+    runtime = cfg.get("runtime", {})
+    runtime_skip_existing = bool(runtime.get("skip_existing", True))
+    if skip_existing is None:
+        skip_existing = runtime_skip_existing
+
+    if state is None:
+        state = load_dataset_state(cfg["dataset"], verbose=bool(runtime.get("verbose", True)))
+
+    image_corr_fit_df = fit_time_image_correlation(
+        state["paths"]["derived_dir"],
+        raw_df=raw_df,
+        skip_existing=skip_existing,
+        **(fit_selection or {}),
+    )
+
+    return {"image_corr_fit_df": image_corr_fit_df}
+
+
 def run_core_pipeline(config: Dict[str, Any], overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
     bead_out = run_bead_core(config, overrides=overrides)
     autocorr_out = run_autocorr_core(config, state=bead_out["state"], overrides=overrides)
+    image_corr_out = run_image_correlation_core(config, state=bead_out["state"], overrides=overrides)
+    image_corr_fit_out = run_image_correlation_fit_core(
+        config,
+        state=bead_out["state"],
+        raw_df=image_corr_out.get("image_corr_df"),
+        overrides=overrides,
+    )
 
     merged = dict(bead_out)
     merged.update(autocorr_out)
+    merged.update(image_corr_out)
+    merged.update(image_corr_fit_out)
     return merged
 
 

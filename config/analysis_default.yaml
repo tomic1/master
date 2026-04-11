@@ -1,6 +1,6 @@
 dataset:
-  base_dir: "/Volumes/TOM_DATA"
-  dataset_id: "AMF_101_003__C640_C470"
+  base_dir: "/Volumes/dataserver_files/Group_Bausch/Tom_Dataserver/20260226"
+  dataset_id: "AMF_092_002__C640_C470"
   variation: ""
   sampling: 1
   tstop: -1
@@ -16,10 +16,12 @@ beads:
   max_bbox_ratio: 6.0
   max_inertia_ratio: 6.0
   search_range_um: 15.0
+  adaptive_stop_px: 1.0
+  adaptive_step: 0.95
   memory: 2
   min_track_length: 2
   threshold_samples: 10
-  compute_angular_speed: true
+  compute_angular_speed: false
   origin_x_um: null
   origin_y_um: null
 
@@ -36,7 +38,71 @@ autocorr:
   subtract_mean: false
   normalize: "c0"
 
+image_corr:
+  enabled: true
+  channel: 0
+  middle_z_for_2d: "middle"
+  frame_step: 1
+  lag_step: 1
+  max_lag_frames: null
+
 runtime:
   skip_existing: true
   save_preview_masks: false
   verbose: true
+
+comparison:
+  enabled: true
+  name: concentration_comparison
+  palette: atp
+  output_root: plots/comparisons
+  registry:
+    - dataset_id: AMF_088_002__C640_C470
+      label: 2 mM ATP
+      color: "#08306b"
+      group: ATP
+      replicate: r1
+      base_dir: data
+    - dataset_id: AMF_101_002__C640_C470
+      label: 0.6 mM ATP
+      color: "#08519c"
+      group: ATP
+      replicate: r2
+      raw_base_dir: /Volumes/dataserver_files/Group_Bausch/Tom_Dataserver/20260318
+      base_dir: data
+    - dataset_id: AMF_089_003__C640_C470
+      label: 0.2 mM ATP
+      color: "#2171b5"
+      group: ATP
+      replicate: r3
+      base_dir: data
+    - dataset_id: AMF_090_003__C640_C470
+      label: 0.02 mM ATP
+      color: "#6baed6"
+      group: ATP
+      replicate: r4
+      base_dir: data
+    - dataset_id: AMF_092_002__C640_C470
+      label: 0.1 µM PRC
+      color: "#a6dba0"
+      group: PRC
+      replicate: r1
+      base_dir: data
+    - dataset_id: AMF_088_002__C640_C470
+      label: 0.3 µM PRC
+      color: "#5aae61"
+      group: PRC
+      replicate: r2
+      base_dir: data
+    - dataset_id: AMF_091_002__C640_C470
+      label: 0.6 µM PRC
+      color: "#1b7837"
+      group: PRC
+      replicate: r3
+      base_dir: data
+    - dataset_id: AMF_093_002__C640_C470
+      label: 2.0 µM PRC
+      color: "#00441b"
+      group: PRC
+      replicate: r4
+      base_dir: data

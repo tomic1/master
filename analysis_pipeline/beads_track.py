@@ -53,6 +53,144 @@ def _parallel_map(worker_fn, items, max_workers: int, desc: str | None = None):
         return list(iterator)
 
 
+def _greedy_subnet_linker(source_set, dest_set, search_range, **kwargs):
+    source_list = list(source_set)
+    dest_list = list(dest_set)
+
+    if not source_list and not dest_list:
+        return [], []
+    if not source_list:
+        return [None] * len(dest_list), dest_list
+    if not dest_list:
+        return source_list, [None] * len(source_list)
+
+    def _point_key(point):
+        pos = np.asarray(getattr(point, "pos", getattr(point, "coords", (0.0,))))
+        return (len(getattr(point, "forward_cands", ())), tuple(pos.tolist()))
+
+    source_list.sort(key=_point_key)
+    available_dests = list(dest_list)
+    linked_sources = []
+    linked_dests = []
+
+    for source in source_list:
+        forward_cands: list[Any] = list(getattr(source, "forward_cands", []))
+        valid_cands = [
+            (cand, dist)
+            for cand, dist in forward_cands
+            if cand is not None and cand in available_dests and dist <= float(search_range)
+        ]
+        if valid_cands:
+            best_dest, _ = min(valid_cands, key=lambda item: item[1])
+            available_dests.remove(best_dest)
+            linked_sources.append(source)
+            linked_dests.append(best_dest)
+        else:
+            linked_sources.append(source)
+            linked_dests.append(None)
+
+    for dest in available_dests:
+        linked_sources.append(None)
+        linked_dests.append(dest)
+
+    return linked_sources, linked_dests
+
+
+def _link_tracks_with_fallback(
+    detections_df: pd.DataFrame,
+    search_range_um: float,
+    memory: int,
+    px_per_micron: float | None,
+    adaptive_stop_px: float = 1.0,
+    adaptive_step: float = 0.95,
+):
+    try:
+        import trackpy as tp  # type: ignore
+    except Exception as exc:
+        raise ImportError("trackpy is required for bead linking") from exc
+
+    def _call_link_df(**kwargs):
+        return tp.link_df(detections_df, **kwargs)
+
+    base_kwargs = {
+        "search_range": float(search_range_um),
+        "memory": int(memory),
+        "pos_columns": ["x_um", "y_um", "z_um"],
+        "t_column": "frame",
+    }
+
+    strategy_supported = True
+
+    if px_per_micron and float(px_per_micron) > 0:
+        pixel_stop_um = float(adaptive_stop_px) / float(px_per_micron)
+    else:
+        pixel_stop_um = float(search_range_um)
+
+    final_stop_um = min(float(search_range_um), max(pixel_stop_um, 1e-6))
+
+    candidate_stops = [
+        float(search_range_um) * 0.5,
+        float(search_range_um) * 0.25,
+        float(search_range_um) * 0.1,
+        final_stop_um,
+    ]
+    adaptive_stops: list[float | None] = [None]
+    for candidate_stop in candidate_stops:
+        if candidate_stop >= final_stop_um and candidate_stop not in adaptive_stops:
+            adaptive_stops.append(candidate_stop)
+    last_exc = None
+
+    attempt_variants: list[dict[str, Any]] = []
+    for stop_scale in adaptive_stops:
+        variant = dict(base_kwargs)
+        if stop_scale is not None:
+            variant["adaptive_stop"] = max(float(stop_scale), 1e-6)
+            variant["adaptive_step"] = float(adaptive_step)
+        attempt_variants.append(variant)
+
+    if strategy_supported:
+        recursive_variant = dict(base_kwargs)
+        recursive_variant["adaptive_stop"] = final_stop_um
+        recursive_variant["adaptive_step"] = float(adaptive_step)
+        recursive_variant["link_strategy"] = "recursive"
+        attempt_variants.append(recursive_variant)
+
+        greedy_variant = dict(base_kwargs)
+        greedy_variant["link_strategy"] = _greedy_subnet_linker
+        attempt_variants.append(greedy_variant)
+
+    for attempt_index, link_kwargs in enumerate(attempt_variants):
+        try:
+            tracks_df = _call_link_df(**link_kwargs)
+            if link_kwargs.get("adaptive_stop") is not None:
+                strategy_label = link_kwargs.get("link_strategy", "auto")
+                print(
+                    "trackpy link_df succeeded "
+                    f"(strategy={strategy_label}, adaptive_stop={link_kwargs['adaptive_stop']:.3g} um)"
+                )
+            return tracks_df
+        except Exception as exc:
+            if exc.__class__.__name__ != "SubnetOversizeException":
+                raise
+            last_exc = exc
+            if attempt_index == 0:
+                print("trackpy link_df hit a subnet oversize; retrying with adaptive_stop")
+            elif link_kwargs.get("link_strategy") == "recursive":
+                print(
+                    "trackpy link_df still oversize with recursive strategy at "
+                    f"adaptive_stop={link_kwargs['adaptive_stop']:.3g} um"
+                )
+            else:
+                print(
+                    "trackpy link_df still oversize at "
+                    f"adaptive_stop={link_kwargs['adaptive_stop']:.3g} um; retrying"
+                )
+
+    if last_exc is None:
+        raise RuntimeError("trackpy link_df failed before a subnet exception was captured")
+    raise last_exc
+
+
 def _threshold_for_frame(args) -> float:
     images, ti_s, channel_to_use = args
     vol_full = images[ti_s, channel_to_use].compute()
@@ -298,18 +436,19 @@ def detect_and_link_beads(state: Dict[str, Any], beads_cfg: Dict[str, Any], skip
 
     tracks_df = detections_df.copy()
     if len(detections_df) > 0 and t_len > 1:
+        tracks_df = _link_tracks_with_fallback(
+            detections_df,
+            search_range_um,
+            memory,
+            px_per_micron=px_per_micron,
+            adaptive_stop_px=float(beads_cfg.get("adaptive_stop_px", 1.0)),
+            adaptive_step=float(beads_cfg.get("adaptive_step", 0.95)),
+        )
         try:
             import trackpy as tp  # type: ignore
         except Exception as exc:
             raise ImportError("trackpy is required for bead linking") from exc
 
-        tracks_df = tp.link_df(
-            detections_df,
-            search_range=search_range_um,
-            memory=memory,
-            pos_columns=["x_um", "y_um", "z_um"],
-            t_column="frame",
-        )
         tracks_df = tracks_df.reset_index(drop=True)
         tracks_df = tp.filter_stubs(tracks_df, min_track_length)
         tracks_df = tracks_df.reset_index(drop=True)
