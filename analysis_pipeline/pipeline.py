@@ -8,6 +8,7 @@ from .autocorr_2d import compute_radial_2d_single, compute_sampled_2d
 from .autocorr_3d import compute_sampled_3d, compute_single_frame_3d
 from .beads_track import detect_and_link_beads, preview_bead_detection
 from .beads_velocity import compute_angular_speed_xy, compute_velocity_from_tracks
+from .vector_correlation import run_vector_correlation_core as _run_vector_correlation_core
 from .image_correlation import compute_raw_time_image_correlation, fit_time_image_correlation
 from .io_dataset import load_dataset_state
 
@@ -50,10 +51,23 @@ def run_autocorr_core(config: Dict[str, Any], state: Dict[str, Any] | None = Non
 
     autocorr_cfg = cfg.get("autocorr", {})
 
-    single3d_df = compute_single_frame_3d(state, autocorr_cfg, skip_existing=skip_existing)
-    sampled3d_df = compute_sampled_3d(state, autocorr_cfg, skip_existing=skip_existing)
-    sampled2d_df = compute_sampled_2d(state, autocorr_cfg, skip_existing=skip_existing)
-    radial2d_df = compute_radial_2d_single(state, autocorr_cfg, skip_existing=skip_existing)
+    single_enabled = bool(autocorr_cfg.get("single_frame_3d_enabled", True))
+    sampled3d_enabled = bool(autocorr_cfg.get("sampled_3d_enabled", True))
+    sampled2d_enabled = bool(autocorr_cfg.get("sampled_2d_enabled", True))
+    radial2d_enabled = bool(autocorr_cfg.get("radial_2d_enabled", True))
+
+    print(
+        "Autocorr status: "
+        f"single3d={'on' if single_enabled else 'off'}, "
+        f"sampled3d={'on' if sampled3d_enabled else 'off'}, "
+        f"sampled2d={'on' if sampled2d_enabled else 'off'}, "
+        f"radial2d={'on' if radial2d_enabled else 'off'}"
+    )
+
+    single3d_df = compute_single_frame_3d(state, autocorr_cfg, skip_existing=skip_existing) if single_enabled and int(autocorr_cfg.get("single_frame_3d", -1)) >= 0 else pd.DataFrame()
+    sampled3d_df = compute_sampled_3d(state, autocorr_cfg, skip_existing=skip_existing) if sampled3d_enabled else pd.DataFrame()
+    sampled2d_df = compute_sampled_2d(state, autocorr_cfg, skip_existing=skip_existing) if sampled2d_enabled else pd.DataFrame()
+    radial2d_df = compute_radial_2d_single(state, autocorr_cfg, skip_existing=skip_existing) if radial2d_enabled else pd.DataFrame()
 
     return {
         "single3d_df": single3d_df,
@@ -108,9 +122,18 @@ def run_image_correlation_fit_core(
     return {"image_corr_fit_df": image_corr_fit_df}
 
 
+def run_vector_correlation_core(
+    config: Dict[str, Any],
+    state: Dict[str, Any] | None = None,
+    overrides: Dict[str, Any] | None = None,
+) -> Dict[str, pd.DataFrame]:
+    return _run_vector_correlation_core(config, state=state, overrides=overrides)
+
+
 def run_core_pipeline(config: Dict[str, Any], overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
     bead_out = run_bead_core(config, overrides=overrides)
     autocorr_out = run_autocorr_core(config, state=bead_out["state"], overrides=overrides)
+    vector_corr_out = run_vector_correlation_core(config, state=bead_out["state"], overrides=overrides)
     image_corr_out = run_image_correlation_core(config, state=bead_out["state"], overrides=overrides)
     image_corr_fit_out = run_image_correlation_fit_core(
         config,
@@ -121,6 +144,7 @@ def run_core_pipeline(config: Dict[str, Any], overrides: Dict[str, Any] | None =
 
     merged = dict(bead_out)
     merged.update(autocorr_out)
+    merged.update(vector_corr_out)
     merged.update(image_corr_out)
     merged.update(image_corr_fit_out)
     return merged

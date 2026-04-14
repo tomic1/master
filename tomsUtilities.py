@@ -4346,7 +4346,7 @@ def mass_mass_corr_per_frame(
     px_per_micron_z=None,
     nbins=120,
     subtract_mean=False,
-    normalize=None  # None | "c0" (divide by c(0)) | "mean2" (divide by <rho>^2)
+    normalize="var2",  # None | "c0" | "mean2" | "var2" (divide by var(rho)^2)
 ):
     """
     Compute the (spatially averaged) mass-mass correlation c(r) for each frame:
@@ -4363,84 +4363,104 @@ def mass_mass_corr_per_frame(
           - None: raw c(r) average (as defined).
           - "c0": divide each profile by its r=0 value.
           - "mean2": divide by <ρ>^2 (uses per-frame mean).
+                    - "var2": divide by var(ρ)^2.
 
     Returns:
         r_centers_um: (nbins,) radii in µm.
         corr_profiles: (T, nbins) radial c(r) per frame (NaN where empty bin).
     """
     imgs = np.asarray(imgs)
-    # allow single 2D image (Y,X) or 2D movie (T,Y,X) or 3D movie (T,Z,Y,X)
     if imgs.ndim == 2:
-        # promote single 2D image to a length-1 movie
         imgs = imgs[np.newaxis, ...]
-    assert imgs.ndim in (3, 4), "imgs must be [Y,X] or [T,Y,X] or [T,Z,Y,X]"
+    if imgs.ndim not in (3, 4):
+        raise ValueError("imgs must be [Y,X] or [T,Y,X] or [T,Z,Y,X]")
 
     is_3d = imgs.ndim == 4
     T = imgs.shape[0]
     if is_3d and px_per_micron_z is None:
-        px_per_micron_z = px_per_micron  # fallback if not provided
+        px_per_micron_z = px_per_micron
 
-    # voxel sizes in µm
     dxy = 1.0 / float(px_per_micron)
-    if is_3d:
-        dz = 1.0 / float(px_per_micron_z)
+    dz = 1.0 / float(px_per_micron_z) if is_3d else dxy
 
-    # Prepare distance grid and binning (depends only on spatial shape)
     spatial_shape = imgs.shape[1:]
     if is_3d:
         Z, Y, X = spatial_shape
         zz = (np.arange(Z) - Z // 2) * dz
         yy = (np.arange(Y) - Y // 2) * dxy
         xx = (np.arange(X) - X // 2) * dxy
-        Zg, Yg, Xg = np.meshgrid(zz, yy, xx, indexing='ij')
-        r_um = np.sqrt(Zg**2 + Yg**2 + Xg**2)
-        box_min_half = 0.5 * min(Z * dz, Y * dxy, X * dxy)
+        Zg, Yg, Xg = np.meshgrid(zz, yy, xx, indexing="ij")
+        r = np.sqrt(Xg**2 + Yg**2 + Zg**2)
     else:
         Y, X = spatial_shape
         yy = (np.arange(Y) - Y // 2) * dxy
         xx = (np.arange(X) - X // 2) * dxy
-        Yg, Xg = np.meshgrid(yy, xx, indexing='ij')
-        r_um = np.sqrt(Yg**2 + Xg**2)
-        box_min_half = 0.5 * min(Y * dxy, X * dxy)
+        Yg, Xg = np.meshgrid(yy, xx, indexing="ij")
+        r = np.sqrt(Xg**2 + Yg**2)
 
-    # radial bins up to the smallest half-box (avoid wrap-around artifacts)
-    edges = np.linspace(0.0, box_min_half, nbins + 1)
-    r_centers_um = 0.5 * (edges[:-1] + edges[1:])
+    if nbins is None or int(nbins) <= 0:
+        bin_size = min((dz, dxy)) if is_3d else dxy
+        bin_index_full = np.floor(r.ravel() / bin_size).astype(int)
+        valid = np.ones_like(bin_index_full, dtype=bool)
+        nbins = int(bin_index_full.max()) + 1 if bin_index_full.size else 0
+        r_centers_um = (np.arange(nbins) + 0.5) * bin_size
+    else:
+        r_max = float(np.nanmax(r))
+        edges = np.linspace(0.0, r_max, int(nbins) + 1)
+        bin_index_full = np.digitize(r.ravel(), edges) - 1
+        valid = (bin_index_full >= 0) & (bin_index_full < int(nbins))
+        bin_index = bin_index_full[valid]
+        r_centers_um = 0.5 * (edges[:-1] + edges[1:])
 
-    # Precompute bin indices and counts once
-    r_flat = r_um.ravel()
-    bin_idx = np.digitize(r_flat, edges) - 1
-    valid = (bin_idx >= 0) & (bin_idx < nbins)
-    bin_idx = bin_idx[valid]
-    ones = np.ones_like(bin_idx, dtype=np.float64)
-    bin_counts = np.bincount(bin_idx, weights=ones, minlength=nbins)
-    bin_counts[bin_counts == 0] = np.nan  # avoid divide-by-zero later
+    corr_profiles = np.empty((T, int(nbins)), dtype=np.float64)
 
-    corr_profiles = np.empty((T, nbins), dtype=np.float64)
     for t in range(T):
-        rho = imgs[t].astype(np.float32, copy=False)
+        image = np.asarray(imgs[t], dtype=float)
         if subtract_mean:
-            rho = rho - float(rho.mean())
+            image = image - float(np.mean(image))
 
-        # c = FFT autocorrelation; bring zero-lag to center for radial averaging
-        F = fftn(rho)
-        c = np.fft.ifftn(np.abs(F)**2).real
-        c = fftshift(c)
+        if image.ndim == 2:
+            power = np.abs(np.fft.fft2(image)) ** 2
+            ac = np.fft.fftshift(np.real(np.fft.ifft2(power)))
+        elif image.ndim == 3:
+            power = np.abs(np.fft.fftn(image)) ** 2
+            ac = np.fft.fftshift(np.real(np.fft.ifftn(power)))
+        else:
+            raise ValueError(f"Unsupported image ndim={image.ndim}")
 
-        w = c.ravel()[valid].astype(np.float64, copy=False)
-        bin_sums = np.bincount(bin_idx, weights=w, minlength=nbins)
-        prof = bin_sums / bin_counts  # spatial average over shell
-
-        if normalize == "c0":
-            zlag = prof[0]
+        var0 = float(np.var(np.asarray(imgs[t], dtype=float)))
+        denom = var0 ** 2
+        if normalize in (None, "var2"):
+            if denom > 0:
+                ac = ac / denom
+            else:
+                ac_max = float(np.max(ac))
+                if ac_max != 0:
+                    ac = ac / ac_max
+        elif normalize == "var":
+            denom = var0
+            if denom > 0:
+                ac = ac / denom
+            else:
+                ac_max = float(np.max(ac))
+                if ac_max != 0:
+                    ac = ac / ac_max
+        elif normalize == "c0":
+            zlag = float(ac.ravel()[ac.ravel().size // 2])
             if np.isfinite(zlag) and zlag != 0:
-                prof = prof / zlag
+                ac = ac / zlag
         elif normalize == "mean2":
-            mu = float(imgs[t].mean())
+            mu = float(np.mean(np.asarray(imgs[t], dtype=float)))
             denom = mu * mu
             if denom != 0:
-                prof = prof / denom
+                ac = ac / denom
 
+        w = ac.ravel()[valid]
+        bin_sums = np.bincount(bin_index, weights=w, minlength=int(nbins))
+        counts = np.bincount(bin_index, minlength=int(nbins))
+
+        prof = bin_sums / np.maximum(counts, 1)
+        prof[counts == 0] = np.nan
         corr_profiles[t] = prof
 
     return r_centers_um, corr_profiles
@@ -5848,6 +5868,7 @@ def animate_bead_displacement_per_frame_overlay(
     *,
     px_per_micron: float,
     bead_channel: int = 1,
+    background_channel: int | None = None,
     scalebar_um: float | None = None,
     scalebar_loc: str = 'lower right',
     scalebar_height_px: int = 6,
@@ -5867,6 +5888,9 @@ def animate_bead_displacement_per_frame_overlay(
     - (T, Y, X)
     - (T, Z, Y, X)
     - (T, C, Z, Y, X)
+
+    If background_channel is provided for a 5D input, that channel is used for the z-max
+    background while the velocity vectors are still drawn from tracks_vel_df.
     """
     from matplotlib.animation import FuncAnimation, FFMpegWriter
 
@@ -5925,7 +5949,8 @@ def animate_bead_displacement_per_frame_overlay(
     def _bg_zmax(ti: int) -> np.ndarray:
         fr = img[int(ti)]
         if len(arr_shape) == 5:
-            fr = fr[int(bead_channel)]
+            channel_idx = int(background_channel if background_channel is not None else bead_channel)
+            fr = fr[channel_idx]
         if hasattr(fr, 'compute'):
             fr = fr.compute()
         fr = np.asarray(fr)

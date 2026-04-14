@@ -16,8 +16,25 @@ def _exp_decay(r, amplitude, xi, offset):
     return amplitude * np.exp(-r / xi) + offset
 
 
-def _fit_decay(r_um: np.ndarray, corr: np.ndarray) -> Dict[str, float]:
+def _fit_range_from_cfg(autocorr_cfg: Dict[str, Any]) -> tuple[float | None, float | None] | None:
+    lower = autocorr_cfg.get("fit_r_um_min")
+    upper = autocorr_cfg.get("fit_r_um_max")
+    if lower is None and upper is None:
+        return None
+    return (
+        float(lower) if lower is not None else None,
+        float(upper) if upper is not None else None,
+    )
+
+
+def _fit_decay(r_um: np.ndarray, corr: np.ndarray, fit_range_um: tuple[float | None, float | None] | None = None) -> Dict[str, float]:
     mask = (r_um > 0) & np.isfinite(r_um) & np.isfinite(corr)
+    if fit_range_um is not None:
+        lower, upper = fit_range_um
+        if lower is not None:
+            mask &= r_um >= float(lower)
+        if upper is not None:
+            mask &= r_um <= float(upper)
     if int(mask.sum()) < 5:
         return {"xi_um": np.nan, "xi_err_um": np.nan}
 
@@ -64,7 +81,8 @@ def _resolve_parallel_workers(requested_workers: Any, task_count: int) -> int:
 def _parallel_map(worker_fn, items, max_workers: int, desc: str | None = None):
     items = list(items)
     if len(items) <= 1 or int(max_workers) <= 1:
-        return [worker_fn(item) for item in items]
+        iterator = tqdm(items, total=len(items), desc=desc) if desc else items
+        return [worker_fn(item) for item in iterator]
 
     with ThreadPoolExecutor(max_workers=int(max_workers)) as executor:
         iterator = executor.map(worker_fn, items)
@@ -85,6 +103,7 @@ def _sampled_2d_frame_rows(args):
         normalize,
         px_xy,
         time_step_s,
+    fit_range_um,
     ) = args
 
     img = images[int(fr), channel, int(z_idx)].compute()
@@ -102,7 +121,7 @@ def _sampled_2d_frame_rows(args):
     )
     corr = np.asarray(corr_prof, dtype=float)[0]
     r = np.asarray(r_um, dtype=float)
-    fit = _fit_decay(r, corr)
+    fit = _fit_decay(r, corr, fit_range_um=fit_range_um)
 
     return [
         {
@@ -135,11 +154,16 @@ def compute_sampled_2d(state: Dict[str, Any], autocorr_cfg: Dict[str, Any], skip
     channel = int(autocorr_cfg.get("channel_2d", autocorr_cfg.get("channel_3d", 0)))
     nbins = int(autocorr_cfg.get("nbins", 120))
     subtract_mean = bool(autocorr_cfg.get("subtract_mean", False))
-    normalize = autocorr_cfg.get("normalize", "c0")
+    normalize = autocorr_cfg.get("normalize", "var2")
 
     sample_count = min(max(1, int(autocorr_cfg.get("sample_count_2d", 20))), t_len)
     frames = np.unique(np.linspace(0, max(t_len - 1, 0), sample_count, dtype=int))
     parallel_workers = _resolve_parallel_workers(autocorr_cfg.get("parallel_workers", 0), len(frames))
+    fit_range_um = _fit_range_from_cfg(autocorr_cfg)
+
+    print(f"Computing sampled 2D autocorr for {len(frames)} frames (workers={parallel_workers})")
+    if fit_range_um is not None:
+        print(f"  Fit range: {fit_range_um[0]} .. {fit_range_um[1]} µm")
 
     px_xy = float(state["calibration"]["px_per_micron"])
     fps = state["calibration"].get("fps")
@@ -163,6 +187,7 @@ def compute_sampled_2d(state: Dict[str, Any], autocorr_cfg: Dict[str, Any], skip
             normalize,
             px_xy,
             time_step_s,
+            fit_range_um,
         )
         for fr in frames
     ]
@@ -192,6 +217,11 @@ def compute_radial_2d_single(state: Dict[str, Any], autocorr_cfg: Dict[str, Any]
     if frame < 0 or frame >= t_len:
         raise ValueError(f"frame_2d out of range: {frame}")
 
+    fit_range_um = _fit_range_from_cfg(autocorr_cfg)
+    print(f"Computing radial 2D autocorr for frame {frame} (channel={channel})")
+    if fit_range_um is not None:
+        print(f"  Fit range: {fit_range_um[0]} .. {fit_range_um[1]} µm")
+
     vol = images[frame, channel].compute()
     vol = np.asarray(vol, dtype=float)
     if vol.ndim == 3:
@@ -212,10 +242,23 @@ def compute_radial_2d_single(state: Dict[str, Any], autocorr_cfg: Dict[str, Any]
     ac = np.fft.fftshift(ac)
 
     center = (ac.shape[0] // 2, ac.shape[1] // 2)
-    c0 = ac[center]
-    if not np.isfinite(c0) or c0 == 0:
-        raise RuntimeError("Invalid central autocorrelation value")
-    ac_norm = ac / float(c0)
+    normalize = autocorr_cfg.get("normalize", "var2")
+    if normalize == "c0":
+        c0 = ac[center]
+        if not np.isfinite(c0) or c0 == 0:
+            raise RuntimeError("Invalid central autocorrelation value")
+        ac_norm = ac / float(c0)
+    elif normalize == "mean2":
+        denom = float(np.nanmean(img)) ** 2
+        if not np.isfinite(denom) or denom == 0:
+            raise RuntimeError("Invalid mean^2 normalization denominator")
+        ac_norm = ac / denom
+    else:
+        var0 = float(np.nanvar(img))
+        denom = var0 ** 2
+        if not np.isfinite(denom) or denom == 0:
+            raise RuntimeError("Invalid variance^2 normalization denominator")
+        ac_norm = ac / denom
 
     y_grid, x_grid = np.indices(ac_norm.shape)
     r_pix = np.sqrt((x_grid - center[1]) ** 2 + (y_grid - center[0]) ** 2)
@@ -234,7 +277,7 @@ def compute_radial_2d_single(state: Dict[str, Any], autocorr_cfg: Dict[str, Any]
     radial = radial[: max_r + 1]
     radial_r_um = np.arange(len(radial), dtype=float) * pix_size_um
 
-    fit = _fit_decay(radial_r_um.astype(float), radial.astype(float))
+    fit = _fit_decay(radial_r_um.astype(float), radial.astype(float), fit_range_um=fit_range_um)
 
     out_df = pd.DataFrame(
         {

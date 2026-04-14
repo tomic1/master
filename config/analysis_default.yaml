@@ -15,7 +15,7 @@ beads:
   min_size_voxels: 5
   max_bbox_ratio: 6.0
   max_inertia_ratio: 6.0
-  search_range_um: 15.0
+  search_range_um: 5.0
   adaptive_stop_px: 1.0
   adaptive_step: 0.95
   memory: 2
@@ -27,16 +27,41 @@ beads:
 
 autocorr:
   enabled: true
+  single_frame_3d_enabled: false
+  sampled_3d_enabled: true
+  sampled_2d_enabled: false
+  radial_2d_enabled: false
   channel_3d: 0
-  single_frame_3d: 0
-  sample_count_3d: 10
-  sample_count_2d: 20
+  single_frame_3d: -1
+  sample_count_3d: 3
+  sample_count_2d: 0
+  parallel_workers: 0
   middle_z_for_2d: "middle"
   frame_2d: 0
   channel_2d: 0
   nbins: 120
-  subtract_mean: false
-  normalize: "c0"
+  subtract_mean: true
+  normalize: "var2"
+  plot_r_um_min: null
+  plot_r_um_max: 200
+  fit_r_um_min: null
+  fit_r_um_max: 100
+
+vector_corr:
+  enabled: true
+  use_unit_vectors: true
+  temporal_max_lag_frames: 50
+  temporal_plot_max_points: 1000
+  temporal_plot_lag_s_min: null
+  temporal_plot_lag_s_max: null
+  temporal_fit_lag_s_min: null
+  temporal_fit_lag_s_max: null
+  spatial_nbins: 40
+  spatial_frame_index: 0
+  spatial_max_radius_um: null
+  spatial_plot_distance_um_min: null
+  spatial_plot_distance_um_max: null
+  parallel_workers: 0
 
 image_corr:
   enabled: true
@@ -52,57 +77,33 @@ runtime:
   verbose: true
 
 comparison:
-  enabled: true
-  name: concentration_comparison
-  palette: atp
+  enabled: false
+  name: prc_104_107_comparison
+  palette: prc
   output_root: plots/comparisons
   registry:
-    - dataset_id: AMF_088_002__C640_C470
-      label: 2 mM ATP
-      color: "#08306b"
-      group: ATP
-      replicate: r1
-      base_dir: data
-    - dataset_id: AMF_101_002__C640_C470
-      label: 0.6 mM ATP
-      color: "#08519c"
-      group: ATP
-      replicate: r2
-      raw_base_dir: /Volumes/dataserver_files/Group_Bausch/Tom_Dataserver/20260318
-      base_dir: data
-    - dataset_id: AMF_089_003__C640_C470
-      label: 0.2 mM ATP
-      color: "#2171b5"
-      group: ATP
-      replicate: r3
-      base_dir: data
-    - dataset_id: AMF_090_003__C640_C470
-      label: 0.02 mM ATP
-      color: "#6baed6"
-      group: ATP
-      replicate: r4
-      base_dir: data
-    - dataset_id: AMF_092_002__C640_C470
-      label: 0.1 µM PRC
-      color: "#a6dba0"
+    - dataset_id: AMF_104_002__C640_C470
+      label: 300 nM PRC
       group: PRC
       replicate: r1
+      raw_base_dir: /Volumes/Tom_Data
       base_dir: data
-    - dataset_id: AMF_088_002__C640_C470
-      label: 0.3 µM PRC
-      color: "#5aae61"
+    - dataset_id: AMF_105_002__C640_C470
+      label: 0 nM PRC
       group: PRC
       replicate: r2
+      raw_base_dir: /Volumes/Tom_Data
       base_dir: data
-    - dataset_id: AMF_091_002__C640_C470
-      label: 0.6 µM PRC
-      color: "#1b7837"
+    - dataset_id: AMF_106_002__C640_C470
+      label: 10 nM PRC
       group: PRC
       replicate: r3
+      raw_base_dir: /Volumes/Tom_Data
       base_dir: data
-    - dataset_id: AMF_093_002__C640_C470
-      label: 2.0 µM PRC
-      color: "#00441b"
+    - dataset_id: AMF_107_002__C640_C470
+      label: 60 nM PRC
       group: PRC
       replicate: r4
+      raw_base_dir: /Volumes/Tom_Data
       base_dir: data
+    

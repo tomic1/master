@@ -1,87 +1,7 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict
-
-
-def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    merged = deepcopy(base)
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
-
-
-def _default_config() -> Dict[str, Any]:
-    return {
-        "dataset": {
-            "base_dir": "/Volumes/Tom_Data",
-            "dataset_id": "",
-            "variation": "",
-            "sampling": 1,
-            "tstop": -1,
-            "xy_cut": 0.0,
-            "z_lower": 0,
-            "z_upper": None,
-            "load_mask_channel": False,
-        },
-        "beads": {
-            "enabled": True,
-            "channel_to_use": 1,
-            "min_size_voxels": 5,
-            "max_bbox_ratio": 3.0,
-            "max_inertia_ratio": 3.0,
-            "search_range_um": 0.5,
-            "adaptive_stop_px": 1.0,
-            "adaptive_step": 0.95,
-            "memory": 1,
-            "min_track_length": 0,
-            "threshold_samples": 10,
-            "parallel_workers": 0,
-            "compute_angular_speed": False,
-            "origin_x_um": None,
-            "origin_y_um": None,
-        },
-        "autocorr": {
-            "enabled": True,
-            "channel_3d": 0,
-            "single_frame_3d": 0,
-            "sample_count_3d": 10,
-            "sample_count_2d": 20,
-            "parallel_workers": 0,
-            "middle_z_for_2d": "middle",
-            "frame_2d": 0,
-            "channel_2d": 0,
-            "nbins": 120,
-            "subtract_mean": False,
-            "normalize": "c0",
-        },
-        "image_corr": {
-            "enabled": True,
-            "channel": 0,
-            "middle_z_for_2d": "middle",
-            "frame_step": 1,
-            "lag_step": 1,
-            "max_lag_frames": None,
-        },
-        "runtime": {
-            "skip_existing": True,
-            "save_preview_masks": False,
-            "verbose": True,
-        },
-        "comparison": {
-            "enabled": False,
-            "name": "concentration_comparison",
-            "palette": "atp",
-            "output_root": "plots/comparisons",
-            "groups": [],
-            "share_axes": True,
-            "show_distribution_stats": True,
-        },
-    }
 
 
 def load_analysis_config(config_path: str) -> Dict[str, Any]:
@@ -108,10 +28,24 @@ def load_analysis_config(config_path: str) -> Dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("Config root must be a mapping")
 
-    return _deep_merge(_default_config(), parsed)
+    return parsed
 
 
 def merge_overrides(config: Dict[str, Any], overrides: Dict[str, Any] | None) -> Dict[str, Any]:
     if not overrides:
+        from copy import deepcopy
+
         return deepcopy(config)
+
+    from copy import deepcopy
+
+    def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+        merged = deepcopy(base)
+        for key, value in override.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = _deep_merge(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
     return _deep_merge(config, overrides)
