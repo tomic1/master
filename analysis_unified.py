@@ -46,21 +46,24 @@ from analysis_pipeline.correlation_plots import (
 from analysis_pipeline.image_correlation import compute_raw_time_image_correlation, fit_time_image_correlation
 from analysis_pipeline.io_dataset import load_dataset_state
 from analysis_pipeline.pipeline import run_autocorr_core, run_vector_correlation_core
+from analysis_pipeline.velocity_movies import build_velocity_artifact_name, build_velocity_artifact_stem, render_bead_displacement_overlay_movie
+from analysis_pipeline.velocity_plots import save_velocity_over_time_dual_pdf
+from analysis_pipeline.vector_correlation import _velocity_output_name
 
 
 DEFAULT_CONFIG_PATH = Path("config/analysis_default.yaml")
 FEATURE_ORDER = ("beads", "autocorr", "image_corr", "vector_corr", "summary")
 
 # Edit these values directly when you want to run the file like a notebook.
-NOTEBOOK_DATASET_ID = "AMF_109_003__C640_C470"
-NOTEBOOK_BASE_DIR = "/Volumes/dataserver_files/Group_Bausch/Tom_Dataserver/20260407"
+NOTEBOOK_DATASET_ID = "AMF_106_002__C640_C470"
+NOTEBOOK_BASE_DIR = "/Volumes/Tom_Data"  # dataserver_files/Group_Bausch/Tom_Dataserver/20260407
 NOTEBOOK_VARIATION: str | None = None
 NOTEBOOK_FEATURE_COMMANDS = [
-    "beads:compute=0,plot=0,overwrite=0",
-    "autocorr:compute=0,plot=0,overwrite=0",
+    "beads:compute=1,plot=1,overwrite=1",
+    "autocorr:compute=1,plot=1,overwrite=1",
     "image_corr:compute=0,plot=0,overwrite=0",
     "vector_corr:compute=1,plot=1,overwrite=1",
-    "summary:compute=0,plot=0,overwrite=0",
+    "summary:compute=1,plot=1,overwrite=1",
 ]
 NOTEBOOK_ENABLE: list[str] = []
 NOTEBOOK_DISABLE: list[str] = []
@@ -70,10 +73,10 @@ NOTEBOOK_RUN_ORDER: list[str] | None = None
 # Short human-readable descriptions for each feature used in the printed
 # summary. These make it explicit what each feature computes and plots.
 FEATURE_DESCRIPTIONS: dict[str, str] = {
-    "beads": "Detects and links beads, computes velocities and optional angular speed; saves preview plots.",
+    "beads": "Detects and links beads, computes velocities and optional angular speed; can also render displacement overlay movies and velocity-over-time plots.",
     "autocorr": "Computes FFT-based 2D/3D autocorrelations and radial averages; saves autocorrelation plots.",
     "image_corr": "Computes time-image correlations and fits; saves raw and fitted correlation plots.",
-    "vector_corr": "Computes temporal, spatial, and tensor bead-motion vector correlations; saves scalar and tensor plots.",
+    "vector_corr": "Computes temporal, spatial, and tensor bead-motion vector correlations; can optionally reject Westerweel-Scarano outliers before plotting.",
     "summary": "Writes a feature manifest summarizing which outputs were produced.",
 }
 
@@ -353,7 +356,13 @@ class AnalysisNotebookRunner:
     ) -> "AnalysisNotebookRunner":
         config = load_analysis_config(str(config_path))
         config = merge_overrides(config, overrides)
-        return cls(config=config)
+        runner = cls(config=config)
+        for feature_name in FEATURE_ORDER:
+            feature_cfg = runner.config.get(feature_name, {})
+            if isinstance(feature_cfg, dict) and "enabled" in feature_cfg:
+                enabled = bool(feature_cfg.get("enabled"))
+                runner.set_feature(feature_name, compute=enabled, plot=enabled)
+        return runner
 
     def load_state(self) -> dict[str, Any]:
         if self.state is None:
@@ -423,12 +432,136 @@ class AnalysisNotebookRunner:
         switch = self.feature_switches[feature_name]
         return {"runtime": {"skip_existing": not switch.overwrite}}
 
+    def _render_displacement_overlay_movie(
+        self,
+        *,
+        state: dict[str, Any],
+        beads_cfg: dict[str, Any],
+        vector_cfg: dict[str, Any],
+        vel_df: pd.DataFrame,
+        plot_dir: Path,
+        overwrite: bool,
+    ) -> Path | None:
+        if not bool(beads_cfg.get("render_displacement_overlay_movie", False)):
+            return None
+        if vel_df is None or vel_df.empty:
+            return None
+
+        overlay_max_vectors_cfg = beads_cfg.get("displacement_overlay_max_vectors")
+        overlay_max_vectors = int(overlay_max_vectors_cfg) if overlay_max_vectors_cfg is not None else None
+        movie_name = build_velocity_artifact_name(f"{state['dataset_id']}_beads_displacement_per_frame_overlay.mp4", vector_cfg)
+        movie_path = plot_dir / movie_name
+        if movie_path.exists() and not overwrite:
+            return movie_path
+
+        fps_value = beads_cfg.get("displacement_overlay_fps")
+        if fps_value is None:
+            fps_value = state["calibration"].get("fps", 1.0)
+
+        render_bead_displacement_overlay_movie(
+            state["images"],
+            vel_df,
+            movie_path,
+            px_per_micron=float(state["calibration"]["px_per_micron"]),
+            vector_cfg=vector_cfg,
+            bead_channel=int(beads_cfg.get("channel_to_use", 1)),
+            background_channel=beads_cfg.get("displacement_overlay_background_channel"),
+            scalebar_um=beads_cfg.get("displacement_overlay_scalebar_um"),
+            scalebar_loc=str(beads_cfg.get("displacement_overlay_scalebar_loc", "lower right")),
+            frame_step=int(beads_cfg.get("displacement_overlay_frame_step", 1)),
+            vector_scale=float(beads_cfg.get("displacement_overlay_vector_scale", 1.0)),
+            max_vectors=overlay_max_vectors,
+            fps=float(fps_value),
+            dpi=int(beads_cfg.get("displacement_overlay_dpi", 150)),
+            show_title=bool(beads_cfg.get("displacement_overlay_show_title", True)),
+            verbose=bool(self.config.get("runtime", {}).get("verbose", True)),
+            progress_every=int(beads_cfg.get("displacement_overlay_progress_every", 10)),
+        )
+        return movie_path
+
+    def _render_bead_velocity_plot(
+        self,
+        *,
+        state: dict[str, Any],
+        beads_cfg: dict[str, Any],
+        vector_cfg: dict[str, Any],
+        vel_df: pd.DataFrame,
+        plot_dir: Path,
+        overwrite: bool,
+    ) -> dict[str, str] | None:
+        if not bool(beads_cfg.get("plot_velocity_over_time", False)):
+            return None
+        if vel_df is None or vel_df.empty:
+            return None
+
+        plot_stem = build_velocity_artifact_stem(f"{state['dataset_id']}_beads_velocity_over_time", vector_cfg)
+        black_path = plot_dir / f"{plot_stem}_black.pdf"
+        white_path = plot_dir / f"{plot_stem}_white.pdf"
+        if black_path.exists() and white_path.exists() and not overwrite:
+            return {"black": str(black_path), "white": str(white_path)}
+
+        fps_value = state["calibration"].get("fps", 1.0)
+        save_velocity_over_time_dual_pdf(
+            vel_df,
+            plot_dir,
+            plot_stem,
+            fps=float(fps_value) if fps_value is not None else None,
+            title="Bead speed over time",
+            dpi=int(beads_cfg.get("velocity_over_time_dpi", beads_cfg.get("displacement_overlay_dpi", 150))),
+        )
+        return {"black": str(black_path), "white": str(white_path)}
+
+    def _plot_bead_outputs(
+        self,
+        *,
+        state: dict[str, Any],
+        beads_cfg: dict[str, Any],
+        vector_cfg: dict[str, Any],
+        vel_df: pd.DataFrame,
+        plot_dir: Path,
+        overwrite: bool,
+        result: dict[str, Any],
+    ) -> None:
+        preview_summary, preview_stats, fig_preview, _ = preview_bead_detection(state, beads_cfg, show=True)
+        result.update({"preview_summary": preview_summary, "preview_stats": preview_stats})
+        dark_path = plot_dir / f"{state['dataset_id']}_bead_preview_dark.pdf"
+        white_path = plot_dir / f"{state['dataset_id']}_bead_preview_white.pdf"
+        fig_preview.savefig(dark_path, dpi=150, bbox_inches="tight")
+        with comparison_style_context("white"):
+            _, _, white_fig, _ = preview_bead_detection(state, beads_cfg, show=False)
+        white_fig.savefig(white_path, dpi=150, bbox_inches="tight")
+        plt.close(white_fig)
+        plt.close(fig_preview)
+
+        velocity_plot_paths = self._render_bead_velocity_plot(
+            state=state,
+            beads_cfg=beads_cfg,
+            vector_cfg=vector_cfg,
+            vel_df=vel_df,
+            plot_dir=plot_dir,
+            overwrite=overwrite,
+        )
+        if velocity_plot_paths is not None:
+            result["velocity_over_time_plot_paths"] = velocity_plot_paths
+
+        movie_path = self._render_displacement_overlay_movie(
+            state=state,
+            beads_cfg=beads_cfg,
+            vector_cfg=vector_cfg,
+            vel_df=vel_df,
+            plot_dir=plot_dir,
+            overwrite=overwrite,
+        )
+        if movie_path is not None:
+            result["displacement_overlay_movie_path"] = movie_path
+
     def _run_beads(self) -> dict[str, Any]:
         switch = self.feature_switches["beads"]
         dataset_cfg = self.config.get("dataset", {})
         dataset_id = str(dataset_cfg.get("dataset_id", ""))
         variation = str(dataset_cfg.get("variation", ""))
         beads_cfg = dict(self.config.get("beads", {}))
+        vector_cfg = dict(self.config.get("vector_corr", {}))
         derived_dir = Path("data") / dataset_id / "derived"
         plot_dir = _ensure_dir(Path("plots") / dataset_id / variation / "beads")
 
@@ -450,17 +583,19 @@ class AnalysisNotebookRunner:
                 result["tracks_ang_df"] = compute_angular_speed_xy(state, vel_df, beads_cfg, skip_existing=not switch.overwrite)
 
             if switch.plot:
-                preview_summary, preview_stats, fig_preview, _ = preview_bead_detection(state, beads_cfg, show=True)
-                result.update({"preview_summary": preview_summary, "preview_stats": preview_stats})
-                dark_path = plot_dir / f"{state['dataset_id']}_bead_preview_dark.pdf"
-                white_path = plot_dir / f"{state['dataset_id']}_bead_preview_white.pdf"
-                fig_preview.savefig(dark_path, dpi=150, bbox_inches="tight")
-                with comparison_style_context("white"):
-                    _, _, white_fig, _ = preview_bead_detection(state, beads_cfg, show=False)
-                white_fig.savefig(white_path, dpi=150, bbox_inches="tight")
-                plt.close(white_fig)
-                plt.close(fig_preview)
+                self._plot_bead_outputs(
+                    state=state,
+                    beads_cfg=beads_cfg,
+                    vector_cfg=vector_cfg,
+                    vel_df=vel_df,
+                    plot_dir=plot_dir,
+                    overwrite=switch.overwrite,
+                    result=result,
+                )
         else:
+            state = self.load_state()
+            derived_dir = Path(state["paths"]["derived_dir"])
+            plot_dir = _ensure_dir(Path(state["paths"]["plots_dir"]) / "beads")
             result.update(
                 {
                     "detections_df": _read_parquet(derived_dir / "beads_detections.parquet"),
@@ -470,6 +605,18 @@ class AnalysisNotebookRunner:
             )
             if bool(beads_cfg.get("compute_angular_speed", False)):
                 result["tracks_ang_df"] = _read_parquet(derived_dir / "beads_tracks_with_angular_speed.parquet")
+            if switch.plot:
+                vel_df_obj = result.get("tracks_vel_df")
+                vel_df = vel_df_obj if isinstance(vel_df_obj, pd.DataFrame) else pd.DataFrame()
+                self._plot_bead_outputs(
+                    state=state,
+                    beads_cfg=beads_cfg,
+                    vector_cfg=vector_cfg,
+                    vel_df=vel_df,
+                    plot_dir=plot_dir,
+                    overwrite=switch.overwrite,
+                    result=result,
+                )
 
         self.outputs["beads"] = result
         return result
@@ -589,6 +736,7 @@ class AnalysisNotebookRunner:
         variation = str(dataset_cfg.get("variation", ""))
         derived_dir = Path("data") / dataset_id / "derived"
         plot_dir = _ensure_dir(Path("plots") / dataset_id / variation / "vector_correlations")
+        tensor_distance_mode = str(vector_cfg.get("tensor_distance_mode", "xyz")).strip().lower()
 
         if switch.compute:
             state = self.load_state()
@@ -597,10 +745,18 @@ class AnalysisNotebookRunner:
             result = run_vector_correlation_core(self.config, state=state, overrides=self._runtime_overrides("vector_corr"))
         else:
             multi_frame_average = bool(vector_cfg.get("multi_frame_average", False))
-            spatial_name = "beads_vector_correlation_spatial_avg.parquet" if multi_frame_average else "beads_vector_correlation_spatial.parquet"
-            tensor_name = "beads_vector_correlation_tensor_avg.parquet" if multi_frame_average else "beads_vector_correlation_tensor.parquet"
+            temporal_name = _velocity_output_name("beads_vector_correlation_temporal.parquet", vector_cfg)
+            spatial_name = _velocity_output_name(
+                "beads_vector_correlation_spatial_avg.parquet" if multi_frame_average else "beads_vector_correlation_spatial.parquet",
+                vector_cfg,
+            )
+            tensor_name = _velocity_output_name(
+                "beads_vector_correlation_tensor_avg.parquet" if multi_frame_average else "beads_vector_correlation_tensor.parquet",
+                vector_cfg,
+                distance_mode=tensor_distance_mode,
+            )
             result = {
-                "temporal_vector_corr_df": _read_parquet(derived_dir / "beads_vector_correlation_temporal.parquet"),
+                "temporal_vector_corr_df": _read_parquet(derived_dir / temporal_name),
                 "spatial_vector_corr_df": _read_parquet(derived_dir / spatial_name),
                 "tensor_vector_corr_df": _read_parquet(derived_dir / tensor_name),
             }
@@ -649,7 +805,8 @@ class AnalysisNotebookRunner:
                             fit_range=temporal_fit_range,
                         )
 
-                    save_vector_correlation_dual_pdf(fig, plot_dir, f"{dataset_id}_temporal_vector_correlation", white_plot_fn=_white_temporal)
+                    temporal_stem = build_velocity_artifact_stem(f"{dataset_id}_temporal_vector_correlation", vector_cfg)
+                    save_vector_correlation_dual_pdf(fig, plot_dir, temporal_stem, white_plot_fn=_white_temporal)
                     print(f"Saved vector temporal correlation plots to {plot_dir}")
                     plt.close(fig)
 
@@ -678,7 +835,8 @@ class AnalysisNotebookRunner:
                             mean_bin_count=int(vector_cfg.get("spatial_nbins", 40)),
                         )
 
-                    save_vector_correlation_dual_pdf(fig, plot_dir, f"{dataset_id}_spatial_vector_correlation", white_plot_fn=_white_spatial)
+                    spatial_stem = build_velocity_artifact_stem(f"{dataset_id}_spatial_vector_correlation", vector_cfg)
+                    save_vector_correlation_dual_pdf(fig, plot_dir, spatial_stem, white_plot_fn=_white_spatial)
                     print(f"Saved vector spatial correlation plots to {plot_dir}")
                     plt.close(fig)
 
@@ -711,7 +869,8 @@ class AnalysisNotebookRunner:
                                 x_range=tensor_plot_range,
                             )
 
-                        save_vector_correlation_dual_pdf(fig, plot_dir, f"{dataset_id}_{stem}", white_plot_fn=_white_tensor)
+                        tensor_stem = build_velocity_artifact_stem(f"{dataset_id}_{stem}", vector_cfg, distance_mode=tensor_distance_mode)
+                        save_vector_correlation_dual_pdf(fig, plot_dir, tensor_stem, white_plot_fn=_white_tensor)
                         print(f"Saved tensor vector correlation plots to {plot_dir} ({part})")
                         plt.close(fig)
 
@@ -750,12 +909,8 @@ class AnalysisNotebookRunner:
                                         min_points=tensor_fit_min_points,
                                     )
 
-                                save_vector_correlation_dual_pdf(
-                                    fig,
-                                    plot_dir,
-                                    f"{dataset_id}_tensor_component_pair_fits_{part}",
-                                    white_plot_fn=_white_tensor_fit,
-                                )
+                                fit_stem = build_velocity_artifact_stem(f"{dataset_id}_tensor_component_pair_fits_{part}", vector_cfg)
+                                save_vector_correlation_dual_pdf(fig, plot_dir, fit_stem, white_plot_fn=_white_tensor_fit)
                                 print(f"Saved tensor pair-fit plots to {plot_dir} ({part})")
                                 plt.close(fig)
 
@@ -763,9 +918,10 @@ class AnalysisNotebookRunner:
         return result
 
     def _run_summary(self) -> dict[str, Any]:
+        state = self.load_state()
         dataset_cfg = self.config.get("dataset", {})
         dataset_id = str(dataset_cfg.get("dataset_id", ""))
-        derived_dir = Path("data") / dataset_id / "derived"
+        derived_dir = Path(state["paths"]["derived_dir"])
         rows = []
         for name in FEATURE_ORDER:
             switch = self.feature_switches[name]
@@ -782,8 +938,31 @@ class AnalysisNotebookRunner:
         summary_df = pd.DataFrame(rows)
         summary_path = derived_dir / "analysis_unified_feature_manifest.parquet"
         summary_df.to_parquet(summary_path, index=False)
+
+        beads_cfg = dict(self.config.get("beads", {}))
+        vector_cfg = dict(self.config.get("vector_corr", {}))
+        bead_outputs = self.outputs.get("beads", {}) if isinstance(self.outputs.get("beads", {}), dict) else {}
+        summary_movie_path = bead_outputs.get("displacement_overlay_movie_path") if isinstance(bead_outputs.get("displacement_overlay_movie_path"), Path) else None
+        if summary_movie_path is None and bool(beads_cfg.get("render_displacement_overlay_movie", False)) and "displacement_overlay_movie_path" not in bead_outputs:
+            plot_dir = _ensure_dir(Path(state["paths"]["plots_dir"]) / "beads")
+            vel_df_obj = bead_outputs.get("tracks_vel_df")
+            vel_df = vel_df_obj if isinstance(vel_df_obj, pd.DataFrame) else pd.DataFrame()
+            if vel_df.empty:
+                vel_df = _read_parquet(derived_dir / "beads_tracks_with_velocity.parquet")
+            summary_movie_path = self._render_displacement_overlay_movie(
+                state=state,
+                beads_cfg=beads_cfg,
+                vector_cfg=vector_cfg,
+                vel_df=vel_df,
+                plot_dir=plot_dir,
+                overwrite=False,
+            )
+            if summary_movie_path is not None:
+                print(f"Saved displacement overlay movie from cached data to {summary_movie_path}")
         print(summary_df.to_string(index=False))
         result = {"summary_df": summary_df, "summary_path": summary_path}
+        if summary_movie_path is not None:
+            result["displacement_overlay_movie_path"] = summary_movie_path
         self.outputs["summary"] = result
         return result
 

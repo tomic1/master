@@ -33,8 +33,21 @@ def compute_velocity_from_tracks(state: Dict[str, Any], tracks_df: pd.DataFrame,
     out_path = os.path.join(derived_dir, "beads_tracks_with_velocity.parquet")
 
     if skip_existing and os.path.exists(out_path):
-        print("Loaded existing velocity tracks from disk")
-        return pd.read_parquet(out_path)
+        existing_df = pd.read_parquet(out_path)
+        required_columns = {
+            "drift_vx_um_s",
+            "drift_vy_um_s",
+            "drift_vz_um_s",
+            "drift_speed_um_s",
+            "vx_drift_corrected_um_s",
+            "vy_drift_corrected_um_s",
+            "vz_drift_corrected_um_s",
+            "speed_drift_corrected_um_s",
+        }
+        if required_columns.issubset(existing_df.columns):
+            print("Loaded existing velocity tracks from disk")
+            return existing_df
+        print("Existing velocity tracks are missing drift-correction columns; recomputing")
 
     if tracks_df is None or len(tracks_df) == 0:
         raise ValueError("tracks_df is empty")
@@ -86,6 +99,18 @@ def compute_velocity_from_tracks(state: Dict[str, Any], tracks_df: pd.DataFrame,
         v[valid_dt] = d_arr[valid_dt] / dt_arr[valid_dt]
         df[col_v] = v
     df["speed_um_s"] = np.sqrt(df["vx_um_s"] ** 2 + df["vy_um_s"] ** 2 + df["vz_um_s"] ** 2)
+
+    drift_df = df.groupby("frame", sort=False)[["vx_um_s", "vy_um_s", "vz_um_s"]].transform("mean")
+    df["drift_vx_um_s"] = drift_df["vx_um_s"]
+    df["drift_vy_um_s"] = drift_df["vy_um_s"]
+    df["drift_vz_um_s"] = drift_df["vz_um_s"]
+    df["drift_speed_um_s"] = np.sqrt(df["drift_vx_um_s"] ** 2 + df["drift_vy_um_s"] ** 2 + df["drift_vz_um_s"] ** 2)
+    df["vx_drift_corrected_um_s"] = df["vx_um_s"] - df["drift_vx_um_s"]
+    df["vy_drift_corrected_um_s"] = df["vy_um_s"] - df["drift_vy_um_s"]
+    df["vz_drift_corrected_um_s"] = df["vz_um_s"] - df["drift_vz_um_s"]
+    df["speed_drift_corrected_um_s"] = np.sqrt(
+        df["vx_drift_corrected_um_s"] ** 2 + df["vy_drift_corrected_um_s"] ** 2 + df["vz_drift_corrected_um_s"] ** 2
+    )
 
     disp = df["disp_um"].to_numpy(dtype=float)
     nonzero = disp > 0

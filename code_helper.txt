@@ -1,1 +1,15 @@
+# zarr embedding command example:
 python embed_existing_zarr.py /Volumes/dataserver_files/Group_Bausch/Tom_Dataserver/20260311/20260311_AMF_095_002.zarr --source-path /Volumes/dataserver_files/Group_Bausch/Tom_Dataserver/20260311/AMF_095_002.vsi --output-root "/Volumes/dataserver_files/Group_Bausch/Tom_Dataserver/20260311"  --overwrite --embed-data
+
+# 7zip mac command example:
+compressing:
+7z a -t7z -mx=0 /Users/tom/Uni_local/master_local/analysis/data/20260311_AMF_095_001__C640_C470.7z  /Users/tom/Uni_local/master_local/analysis/data/AMF_076_01__C640_C470
+
+extracting:
+7z x /Volumes/X9/AMF_110_002__C640_C470.7z /Volumes/X9
+
+ls *.7z | parallel -j 2 '
+  name={.};
+  mkdir -p "$name";
+  7z x -y {}
+'
