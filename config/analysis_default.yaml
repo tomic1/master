@@ -44,27 +44,43 @@ autocorr:
   normalize: "var2"
   plot_r_um_min: null
   plot_r_um_max: 200
-  fit_r_um_min: null
+  fit_r_um_min: 1
   fit_r_um_max: 100
 
 vector_corr:
   enabled: true
   use_unit_vectors: true
+  multi_frame_average: true
+  multi_frame_count: 100
   temporal_max_lag_frames: 50
   temporal_plot_max_points: 1000
   temporal_plot_lag_s_min: null
   temporal_plot_lag_s_max: null
   temporal_fit_lag_s_min: null
   temporal_fit_lag_s_max: null
-  spatial_nbins: 40
-  spatial_frame_index: 0
+  spatial_nbins: 80
+  spatial_frame_index: 2
   spatial_max_radius_um: null
   spatial_plot_distance_um_min: null
   spatial_plot_distance_um_max: null
+  tensor_enabled: true
+  tensor_frame_index: 2
+  tensor_use_unit_vectors: true
+  tensor_nbins: 80
+  tensor_max_radius_um: null
+  tensor_plot_distance_um_min: 0
+  tensor_plot_distance_um_max: null
+  tensor_fit_enabled: true
+  tensor_fit_parts:
+    - antisymmetric
+  tensor_fit_component_pairs: [zx,xy,yz]
+  tensor_fit_distance_um_min: null
+  tensor_fit_distance_um_max: null
+  tensor_fit_min_points: 4
   parallel_workers: 0
 
 image_corr:
-  enabled: true
+  enabled: false
   channel: 0
   middle_z_for_2d: "middle"
   frame_step: 1

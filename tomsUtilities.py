@@ -5588,6 +5588,9 @@ def plot_spatial_vector_correlation(
     spatial_corr_df: pd.DataFrame,
     *,
     fit_exp: bool = True,
+    plot_min_r_um: float | None = None,
+    plot_max_r_um: float | None = None,
+    fit_min_r_um: float | None = None,
     fit_max_r_um: float | None = None,
     fit_min_points: int = 4,
     show_std: bool = True,
@@ -5618,6 +5621,18 @@ def plot_spatial_vector_correlation(
     r_vals = pivot_S.columns.to_numpy(dtype=float)
     frame_vals = pivot_S.index.to_numpy(dtype=int)
     arr_S = pivot_S.to_numpy(dtype=float)
+
+    plot_mask = np.ones_like(r_vals, dtype=bool)
+    if plot_min_r_um is not None:
+        plot_mask &= r_vals >= float(plot_min_r_um)
+    if plot_max_r_um is not None:
+        plot_mask &= r_vals <= float(plot_max_r_um)
+    if not np.any(plot_mask):
+        raise ValueError('No spatial vector-correlation data in the requested plot range')
+
+    r_vals = r_vals[plot_mask]
+    arr_S = arr_S[:, plot_mask]
+
     mean_S = np.nanmean(arr_S, axis=0)
     std_S = np.nanstd(arr_S, axis=0)
 
@@ -5672,9 +5687,18 @@ def plot_spatial_vector_correlation(
         'message': 'fit disabled',
     }
     if fit_exp:
+        fit_x = r_vals
+        fit_y = mean_S
+        fit_mask = np.isfinite(fit_x) & np.isfinite(fit_y) & (fit_x > 0)
+        if fit_min_r_um is not None:
+            fit_mask &= fit_x >= float(fit_min_r_um)
+        if fit_max_r_um is not None:
+            fit_mask &= fit_x <= float(fit_max_r_um)
+        fit_x = fit_x[fit_mask]
+        fit_y = fit_y[fit_mask]
         fit_result = _fit_exp_decay_positive_x(
-            r_vals,
-            mean_S,
+            fit_x,
+            fit_y,
             min_points=int(fit_min_points),
             max_x=fit_max_r_um,
         )
@@ -5682,9 +5706,9 @@ def plot_spatial_vector_correlation(
             xi = float(fit_result['tau'])
             xi_se = float(fit_result.get('tau_se', np.nan))
             if np.isfinite(xi_se):
-                fit_label = f"exp fit (xi={xi:.3g}±{xi_se:.2g} µm)"
+                fit_label = rf"exp fit ($\xi={xi:.3g}\pm{xi_se:.2g}\,\mu\mathrm{{m}}$)"
             else:
-                fit_label = f"exp fit (xi={xi:.3g} µm)"
+                fit_label = rf"exp fit ($\xi={xi:.3g}\,\mu\mathrm{{m}}$)"
             ax0.plot(
                 fit_result['x_fit'],
                 fit_result['y_fit'],
