@@ -211,7 +211,7 @@ def _detect_frame_detections(args):
         max_inertia_ratio,
         dataset_id,
     ) = args
-
+    print(f"Detecting beads in frame {ti}")
     raw_vol = images[ti, channel_to_use].compute()
     binary = raw_vol.astype(np.float32) > float(thr)
     binary = _remove_small_objects_compat(binary, int(min_size_voxels))

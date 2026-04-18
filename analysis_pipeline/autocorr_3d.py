@@ -7,6 +7,7 @@ from typing import Any, Dict, List
 import numpy as np
 import pandas as pd
 from scipy.optimize import curve_fit
+from scipy import fft as spfft
 from tqdm import tqdm
 
 
@@ -25,9 +26,16 @@ def _fit_range_from_cfg(autocorr_cfg: Dict[str, Any]) -> tuple[float | None, flo
     )
 
 
-def _fit_decay(r_um: np.ndarray, corr: np.ndarray, fit_range_um: tuple[float | None, float | None] | None = None) -> Dict[str, float]:
+def _fit_decay(
+    r_um: np.ndarray,
+    corr: np.ndarray,
+    fit_range_um: tuple[float | None, float | None] | None = None,
+    *,
+    fit_mode: str = "standard",
+) -> Dict[str, float]:
     mask = (r_um > 0) & np.isfinite(r_um) & np.isfinite(corr)
-    if fit_range_um is not None:
+    fit_mode_norm = str(fit_mode).strip().lower()
+    if fit_range_um is not None and fit_mode_norm not in {"weighted_near0", "weighted-near0", "near0_weighted", "near0-weighted"}:
         lower, upper = fit_range_um
         if lower is not None:
             mask &= r_um >= float(lower)
@@ -42,6 +50,14 @@ def _fit_decay(r_um: np.ndarray, corr: np.ndarray, fit_range_um: tuple[float | N
     xi_guess = max(0.1, float(np.nanmax(r_fit))/10)
     offset_guess = float(np.nanmin(c_fit))
 
+    sigma = None
+    absolute_sigma = False
+    if fit_mode_norm in {"weighted_near0", "weighted-near0", "near0_weighted", "near0-weighted"}:
+        r_scale = max(float(np.nanmax(r_fit)), 1e-6)
+        sigma = 0.2 + (2.5 / r_scale) * r_fit
+    elif fit_mode_norm not in {"standard", "unweighted", "default", ""}:
+        raise ValueError("fit_mode must be 'standard' or 'weighted_near0'")
+
     try:
         popt, pcov = curve_fit(
             _exp_decay,
@@ -49,6 +65,8 @@ def _fit_decay(r_um: np.ndarray, corr: np.ndarray, fit_range_um: tuple[float | N
             c_fit,
             p0=[amp_guess, xi_guess, offset_guess],
             bounds=([0.0, 0.01, -np.inf], [np.inf, np.inf, np.inf]),
+            sigma=sigma,
+            absolute_sigma=absolute_sigma,
             maxfev=20000,
         )
         perr = np.sqrt(np.abs(np.diag(pcov))) if pcov is not None else np.full(popt.shape, np.nan)
@@ -70,39 +88,81 @@ def _pxz(state: Dict[str, Any]) -> float:
     return float(px_z) if px_z and float(px_z) > 0 else float(px_xy)
 
 
-def _autocorr_3d_reference(volume: np.ndarray, px_xy: float, px_z: float, subtract_mean: bool = False) -> tuple[np.ndarray, np.ndarray]:
-    image = np.asarray(volume, dtype=float)
-    image = image - float(np.mean(image))
-
-    spectrum = np.fft.fftn(image)
-    ac = np.fft.fftshift(np.real(np.fft.ifftn(np.abs(spectrum) ** 2)))
-    ac = ac / image.size
-
-    var0 = float(np.var(np.asarray(volume, dtype=float)))
-    if var0 > 0:
-        ac = ac / var0
-    else:
-        ac = ac / np.max(ac)
-
+def _radial_average_3d(ac: np.ndarray, px_xy: float, px_z: float) -> tuple[np.ndarray, np.ndarray]:
+    z_len, y_len, x_len = ac.shape
     dz = 1.0 / float(px_z)
     dxy = 1.0 / float(px_xy)
-    z, y, x = image.shape
-    zz = (np.arange(z) - z // 2) * dz
-    yy = (np.arange(y) - y // 2) * dxy
-    xx = (np.arange(x) - x // 2) * dxy
-    zg, yg, xg = np.meshgrid(zz, yy, xx, indexing="ij")
-    r = np.sqrt(xg**2 + yg**2 + zg**2)
+
+    z_coords = (np.arange(z_len) - z_len // 2) * dz
+    y_coords = (np.arange(y_len) - y_len // 2) * dxy
+    x_coords = (np.arange(x_len) - x_len // 2) * dxy
+
+    xy_radius_sq = y_coords[:, None] ** 2 + x_coords[None, :] ** 2
+    center_y = y_len // 2
+    center_x = x_len // 2
+    center_z = z_len // 2
 
     bin_size = min(dz, dxy)
-    r_flat = r.ravel()
-    v_flat = ac.ravel()
-    bin_index = np.floor(r_flat / bin_size).astype(int)
-    nbins = int(bin_index.max()) + 1 if bin_index.size else 0
-    sums = np.bincount(bin_index, weights=v_flat, minlength=nbins)
-    counts = np.bincount(bin_index, minlength=nbins)
-    radial_mean = sums / np.maximum(counts, 1)
+    r_max = float(np.sqrt(np.max(xy_radius_sq) + np.max(z_coords**2)))
+    nbins = int(np.floor(r_max / bin_size)) + 1
+    sums = np.zeros(nbins, dtype=float)
+    counts = np.zeros(nbins, dtype=float)
+
+    for z_idx, z_val in enumerate(z_coords):
+        r = np.sqrt(xy_radius_sq + float(z_val) ** 2)
+        bin_index = np.floor(r / bin_size).astype(np.int32)
+        values = np.asarray(ac[z_idx], dtype=float)
+        mask = np.ones_like(values, dtype=bool)
+        if z_idx == center_z:
+            mask[center_y, center_x] = False
+        valid = mask.ravel()
+        bins = bin_index.ravel()[valid]
+        vals = values.ravel()[valid]
+        sums += np.bincount(bins, weights=vals, minlength=nbins)
+        counts += np.bincount(bins, minlength=nbins)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        valid_bins = counts > 0
+        radial_mean = sums[valid_bins] / counts[valid_bins]
+
     r_centers = (np.arange(nbins) + 0.5) * bin_size
-    return r_centers, radial_mean
+    r_centers = r_centers[valid_bins]
+    zero_lag = float(ac[center_z, center_y, center_x])
+    return np.concatenate(([0.0], r_centers)), np.concatenate(([zero_lag], radial_mean))
+
+
+def _autocorr_3d_reference(
+    volume: np.ndarray,
+    px_xy: float,
+    px_z: float,
+    subtract_mean: bool = False,
+    fft_mode: str = "linear",
+) -> tuple[np.ndarray, np.ndarray]:
+    image = np.asarray(volume, dtype=np.float32)
+    if bool(subtract_mean):
+        image = image - float(np.mean(image))
+
+    fft_mode_norm = str(fft_mode).strip().lower()
+    if fft_mode_norm in {"linear", "padded", "zero_padded", "zero-padded"}:
+        pad_shape: tuple[int, ...] = tuple(int(2 * int(size) - 1) for size in image.shape)
+        spectrum = spfft.rfftn(image, s=pad_shape)
+        ac = spfft.irfftn(np.abs(spectrum) ** 2, s=pad_shape)  # type: ignore[call-overload]
+    elif fft_mode_norm in {"circular", "periodic"}:
+        pad_shape: tuple[int, ...] = tuple(int(size) for size in image.shape)
+        spectrum = spfft.rfftn(image)
+        ac = spfft.irfftn(np.abs(spectrum) ** 2, s=pad_shape)  # type: ignore[call-overload]
+    else:
+        raise ValueError("fft_mode must be 'linear' or 'circular'")
+
+    ac = np.fft.fftshift(np.asarray(ac, dtype=np.float32))
+    ac = ac / float(image.size)
+
+    var0 = float(np.var(image))
+    if not np.isfinite(var0) or var0 <= 0:
+        raise RuntimeError("Cannot normalize 3D autocorrelation of a zero-variance volume")
+    ac = ac / var0
+
+    return _radial_average_3d(ac, px_xy, px_z)
 
 
 def _resolve_parallel_workers(requested_workers: Any, task_count: int) -> int:
@@ -141,6 +201,8 @@ def _sampled_3d_frame_rows(args):
         fr,
         channel,
         subtract_mean,
+        fft_mode,
+        fit_mode,
         px_xy,
         px_z,
         time_step_s,
@@ -152,8 +214,8 @@ def _sampled_3d_frame_rows(args):
     if vol.ndim != 3:
         return []
 
-    r, corr = _autocorr_3d_reference(vol, px_xy, px_z, subtract_mean=subtract_mean)
-    fit = _fit_decay(r, corr, fit_range_um=fit_range_um)
+    r, corr = _autocorr_3d_reference(vol, px_xy, px_z, subtract_mean=subtract_mean, fft_mode=fft_mode)
+    fit = _fit_decay(r, corr, fit_range_um=fit_range_um, fit_mode=fit_mode)
 
     return [
         {
@@ -165,6 +227,8 @@ def _sampled_3d_frame_rows(args):
             "corr": float(ci),
             "xi_um": fit.get("xi_um", np.nan),
             "xi_err_um": fit.get("xi_err_um", np.nan),
+            "amp": fit.get("amp", np.nan),
+            "offset": fit.get("offset", np.nan),
         }
         for ri, ci in zip(r.tolist(), corr.tolist())
     ]
@@ -183,6 +247,8 @@ def compute_single_frame_3d(state: Dict[str, Any], autocorr_cfg: Dict[str, Any],
     frame = int(autocorr_cfg.get("single_frame_3d", 0))
     channel = int(autocorr_cfg.get("channel_3d", 0))
     subtract_mean = bool(autocorr_cfg.get("subtract_mean", False))
+    fft_mode = str(autocorr_cfg.get("fft_mode", "linear"))
+    fit_mode = str(autocorr_cfg.get("fit_mode", "standard"))
     fit_range_um = _fit_range_from_cfg(autocorr_cfg)
 
     if frame < 0 or frame >= t_len:
@@ -200,8 +266,8 @@ def compute_single_frame_3d(state: Dict[str, Any], autocorr_cfg: Dict[str, Any],
     if fit_range_um is not None:
         print(f"  Fit range: {fit_range_um[0]} .. {fit_range_um[1]} µm")
 
-    r_um, c = _autocorr_3d_reference(vol, px_xy, px_z, subtract_mean=subtract_mean)
-    fit = _fit_decay(np.asarray(r_um, dtype=float), np.asarray(c, dtype=float), fit_range_um=fit_range_um)
+    r_um, c = _autocorr_3d_reference(vol, px_xy, px_z, subtract_mean=subtract_mean, fft_mode=fft_mode)
+    fit = _fit_decay(np.asarray(r_um, dtype=float), np.asarray(c, dtype=float), fit_range_um=fit_range_um, fit_mode=fit_mode)
 
     out_df = pd.DataFrame(
         {
@@ -212,6 +278,8 @@ def compute_single_frame_3d(state: Dict[str, Any], autocorr_cfg: Dict[str, Any],
             "corr": np.asarray(c, dtype=float),
             "xi_um": [fit.get("xi_um", np.nan)] * len(r_um),
             "xi_err_um": [fit.get("xi_err_um", np.nan)] * len(r_um),
+            "amp": [fit.get("amp", np.nan)] * len(r_um),
+            "offset": [fit.get("offset", np.nan)] * len(r_um),
         }
     )
     out_df.to_parquet(out_path, index=False)
@@ -231,6 +299,8 @@ def compute_sampled_3d(state: Dict[str, Any], autocorr_cfg: Dict[str, Any], skip
     t_len = int(state["dims"]["T"])
     channel = int(autocorr_cfg.get("channel_3d", 0))
     subtract_mean = bool(autocorr_cfg.get("subtract_mean", False))
+    fft_mode = str(autocorr_cfg.get("fft_mode", "linear"))
+    fit_mode = str(autocorr_cfg.get("fit_mode", "standard"))
     fit_range_um = _fit_range_from_cfg(autocorr_cfg)
 
     sample_count = min(max(1, int(autocorr_cfg.get("sample_count_3d", 10))), t_len)
@@ -253,6 +323,8 @@ def compute_sampled_3d(state: Dict[str, Any], autocorr_cfg: Dict[str, Any], skip
             int(fr),
             int(channel),
             bool(subtract_mean),
+            fft_mode,
+            fit_mode,
             px_xy,
             px_z,
             time_step_s,

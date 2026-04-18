@@ -18,10 +18,10 @@ ATP_COMPARISON_COLORS = (
 )
 
 PRC_COMPARISON_COLORS = (
-    "#a6dba0",
-    "#5aae61",
-    "#1b7837",
-    "#00441b",
+    "#fff7bc",
+    "#fec44f",
+    "#fd8d3c",
+    "#e31a1c",
 )
 
 
@@ -34,6 +34,7 @@ class ComparisonSpec:
     replicate: str = ""
     variation: str = ""
     base_dir: str | None = None
+    raw_base_dir: str | None = None
 
 
 def _resample_palette(anchors: Sequence[str], n: int) -> list[str]:
@@ -51,7 +52,13 @@ def comparison_palette(kind: str, n: int) -> list[str]:
     if kind_norm in {"atp", "blue", "b"}:
         return _resample_palette(ATP_COMPARISON_COLORS, n)
     if kind_norm in {"prc", "green", "g"}:
-        return _resample_palette(PRC_COMPARISON_COLORS, n)
+        cmap = cm.get_cmap("YlOrRd")
+        if n <= 0:
+            return []
+        if n == 1:
+            return [to_hex(cmap(0.55))]
+        samples = np.linspace(0.25, 0.9, n)
+        return [to_hex(cmap(value)) for value in samples]
     cmap = cm.get_cmap("tab10")
     if n <= 0:
         return []
@@ -162,6 +169,7 @@ def build_comparison_specs(
                     replicate=str(entry.get("replicate", "")).strip(),
                     variation=str(entry.get("variation", "")).strip(),
                     base_dir=entry.get("base_dir"),
+                    raw_base_dir=entry.get("raw_base_dir"),
                 )
             )
             continue
@@ -175,6 +183,7 @@ def build_comparison_specs(
         group = str(entry[3]).strip() if len(entry) >= 4 and entry[3] else ""
         variation = str(entry[4]).strip() if len(entry) >= 5 and entry[4] else ""
         base_dir = entry[5] if len(entry) >= 6 else None
+        raw_base_dir = entry[6] if len(entry) >= 7 else None
 
         if not dataset_id:
             raise ValueError("comparison dataset tuples must define a dataset_id")
@@ -188,6 +197,7 @@ def build_comparison_specs(
                 replicate="",
                 variation=variation,
                 base_dir=base_dir,
+                raw_base_dir=raw_base_dir,
             )
         )
 

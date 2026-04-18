@@ -15,10 +15,10 @@ beads:
   min_size_voxels: 5
   max_bbox_ratio: 6.0
   max_inertia_ratio: 6.0
-  search_range_um: 5.0
+  search_range_um: 10.0
   adaptive_stop_px: 1.0
   adaptive_step: 0.95
-  memory: 2
+  memory: 1
   min_track_length: 2
   threshold_samples: 10
   compute_angular_speed: false
@@ -29,19 +29,19 @@ beads:
   displacement_overlay_vector_scale: 2.0
   displacement_overlay_max_vectors: 3000
   displacement_overlay_dpi: 150
-  displacement_overlay_show_title: false
+  displacement_overlay_show_title: true
   origin_x_um: null
   origin_y_um: null
 
 autocorr:
   enabled: true
-  single_frame_3d_enabled: false
+  single_frame_3d_enabled: true
   sampled_3d_enabled: true
   sampled_2d_enabled: false
   radial_2d_enabled: false
   channel_3d: 0
   single_frame_3d: -1
-  sample_count_3d: 2
+  sample_count_3d: 5
   sample_count_2d: 0
   parallel_workers: 0
   middle_z_for_2d: "middle"
@@ -49,11 +49,13 @@ autocorr:
   channel_2d: 0
   nbins: 120
   subtract_mean: true
+  fft_mode: circular
+  fit_mode: weighted_near0  # or weighted_near0
   normalize: "var2"
-  plot_r_um_min: null
-  plot_r_um_max: 200
-  fit_r_um_min: 0.1
-  fit_r_um_max: 20
+  plot_r_um_min: 1
+  plot_r_um_max: 25
+  fit_r_um_min: null
+  fit_r_um_max: null
 
 vector_corr:
   enabled: true
@@ -65,20 +67,20 @@ vector_corr:
   velocity_outlier_min_neighbors: 4
   velocity_outlier_threshold: 2.0
   multi_frame_average: true
-  multi_frame_count: 200
-  temporal_max_lag_frames: 50
+  multi_frame_count: 10
+  temporal_max_lag_frames: 100
   temporal_plot_max_points: 1000
   temporal_plot_lag_s_min: null
   temporal_plot_lag_s_max: null
   temporal_fit_lag_s_min: null
   temporal_fit_lag_s_max: null
-  spatial_nbins: 80
-  spatial_frame_index: 2
+  spatial_nbins: 200
+  spatial_frame_index: 90
   spatial_max_radius_um: null
   spatial_plot_distance_um_min: null
   spatial_plot_distance_um_max: null
   tensor_enabled: true
-  tensor_frame_index: 2
+  tensor_frame_index: 90
   tensor_use_unit_vectors: true
   tensor_distance_mode: xy
   tensor_nbins: 80
@@ -88,10 +90,12 @@ vector_corr:
   tensor_fit_enabled: true
   tensor_fit_parts:
     - antisymmetric
-    - full
-  tensor_fit_component_pairs: [zx,xy,yz,xx,yy,zz]
-  tensor_fit_distance_um_min: null
-  tensor_fit_distance_um_max: null
+    - symmetric
+  tensor_fit_component_pairs_by_part:
+    antisymmetric: [zx, xy, yz]
+    symmetric: [xx, yy, zz]
+  tensor_fit_distance_um_min: 5
+  tensor_fit_distance_um_max: 200
   tensor_fit_min_points: 4
   parallel_workers: 0
 
@@ -109,33 +113,49 @@ runtime:
   verbose: true
 
 comparison:
-  enabled: false
-  name: prc_104_107_comparison
+  enabled: true
+  name: prc_104_109_comparison
   palette: prc
   output_root: plots/comparisons
+  autocorr_sample_mode: mean  # mean | frame
+  autocorr_sample_frame: 0
+  apply_notebook_feature_commands_to_single_datasets: true
   registry:
-    - dataset_id: AMF_104_002__C640_C470
-      label: 300 nM PRC
+    - dataset_id: AMF_105_002__C640_C470
+      label: 0 nM
       group: PRC
       replicate: r1
       raw_base_dir: /Volumes/Tom_Data
       base_dir: data
-    - dataset_id: AMF_105_002__C640_C470
-      label: 0 nM PRC
+    - dataset_id: AMF_106_002__C640_C470
+      label: 10 nM
       group: PRC
       replicate: r2
       raw_base_dir: /Volumes/Tom_Data
       base_dir: data
-    - dataset_id: AMF_106_002__C640_C470
-      label: 10 nM PRC
+    - dataset_id: AMF_107_002__C640_C470
+      label: 60 nM
       group: PRC
       replicate: r3
       raw_base_dir: /Volumes/Tom_Data
       base_dir: data
-    - dataset_id: AMF_107_002__C640_C470
-      label: 60 nM PRC
+    - dataset_id: AMF_108_002__C640_C470
+      label: 100 nM
       group: PRC
       replicate: r4
+      raw_base_dir: /Volumes/X9
+      base_dir: data
+    - dataset_id: AMF_109_003__C640_C470
+      label: 150 nM
+      group: PRC
+      replicate: r5
+      raw_base_dir: /Volumes/X9
+      base_dir: data
+    - dataset_id: AMF_104_002__C640_C470
+      label: 300 nM
+      group: PRC
+      replicate: r6
       raw_base_dir: /Volumes/Tom_Data
       base_dir: data
+
     

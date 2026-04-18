@@ -85,6 +85,22 @@ def _decay_symbol_and_unit(x_col: str) -> tuple[str, str]:
     return r"\xi", r"\mu\mathrm{m}"
 
 
+def _format_decay_annotation(symbol: str, value: float, uncertainty: float | None, unit: str) -> str:
+    if not np.isfinite(value):
+        return rf"${symbol}=\mathrm{{nan}}\,{unit}$"
+
+    if uncertainty is not None and np.isfinite(uncertainty) and uncertainty > 0:
+        decimals = max(0, int(max(0, -np.floor(np.log10(abs(float(uncertainty)))) + 1)))
+    else:
+        decimals = 3
+
+    value_str = f"{float(value):.{decimals}f}"
+    if uncertainty is not None and np.isfinite(uncertainty):
+        uncertainty_str = f"{float(uncertainty):.{decimals}f}"
+        return rf"${symbol}={value_str}\pm{uncertainty_str}\,{unit}$"
+    return rf"${symbol}={value_str}\,{unit}$"
+
+
 def _score_column(df: pd.DataFrame) -> str:
     return "score" if "score" in df.columns else "corr"
 
@@ -313,7 +329,7 @@ def _plot_scatter(
             fit_line = _exp_decay(x_fit, *popt)
             symbol, unit = _decay_symbol_and_unit(x_col)
             if xi_err is not None and np.isfinite(xi_err):
-                label = rf"fit (${symbol}={xi:.4g}\pm{xi_err:.2g}\,{unit}$)"
+                label = rf"fit (${symbol}={xi:.4g}\pm{xi_err:.4g}\,{unit}$)"
             else:
                 label = rf"fit (${symbol}={xi:.4g}\,{unit}$)"
             ax.plot(x_fit, fit_line, ls="--", lw=1.7, color="#F58518", label=label)
@@ -358,9 +374,9 @@ def _plot_by_component(ax, df: pd.DataFrame, x_col: str, *, title: str | None = 
                 y_fit = _exp_decay(x_fit, *popt)
                 symbol, unit = _decay_symbol_and_unit(x_col)
                 if xi_err is not None and np.isfinite(xi_err):
-                    fit_label = rf"{component} fit (${symbol}={xi:.2g}\pm{xi_err:.2g}\,{unit}$)"
+                    fit_label = rf"{component} fit (${symbol}={xi:.3g}\pm{xi_err:.3g}\,{unit}$)"
                 else:
-                    fit_label = rf"{component} fit (${symbol}={xi:.2g}\,{unit}$)"
+                    fit_label = rf"{component} fit (${symbol}={xi:.3g}\,{unit}$)"
                 ax.plot(x_fit, y_fit, ls="--", lw=1.5, label=fit_label)
 
     if title:
@@ -596,7 +612,8 @@ def plot_vector_tensor_pair_decay(
         x_series.append(x)
         y_series.append(y)
 
-        ax.plot(x, y, lw=1.8, color=color, label=pair)
+        data_label = pair
+        symbol, unit = r"\xi", r"\mu\mathrm{m}"
         if yerr is not None and np.any(np.isfinite(yerr)):
             ax.fill_between(x, y - yerr, y + yerr, alpha=0.12, color=color)
 
@@ -619,11 +636,10 @@ def plot_vector_tensor_pair_decay(
             if x_max > x_min:
                 x_fit = np.linspace(x_min, x_max, 250)
                 y_fit = _exp_decay(x_fit, *popt)
-                if xi_err is not None and np.isfinite(xi_err):
-                    fit_label = rf"{pair} fit ($\xi={xi:.2g}\pm{xi_err:.2g}\,\mu\mathrm{{m}}$)"
-                else:
-                    fit_label = rf"{pair} fit ($\xi={xi:.2g}\,\mu\mathrm{{m}}$)"
-                ax.plot(x_fit, y_fit, ls="--", lw=1.5, color=color, alpha=0.85, label=fit_label)
+                data_label = f"{pair} ({_format_decay_annotation(symbol, xi, xi_err, unit)})"
+                ax.plot(x_fit, y_fit, ls="--", lw=1.5, color=color, alpha=0.85, label="_nolegend_")
+
+        ax.plot(x, y, lw=1.8, color=color, label=data_label)
 
     if title:
         ax.set_title(title)
