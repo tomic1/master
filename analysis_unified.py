@@ -41,6 +41,8 @@ from analysis_pipeline.comparison import (
     comparison_output_dir,
     comparison_palette,
     comparison_style_context,
+    comparison_registry_from_config,
+    resolve_comparison_preset,
     save_comparison_dual_pdf,
 )
 from analysis_pipeline.config import load_analysis_config, merge_overrides
@@ -63,14 +65,14 @@ DEFAULT_CONFIG_PATH = Path("config/analysis_default.yaml")
 FEATURE_ORDER = ("beads", "autocorr", "image_corr", "vector_corr", "summary")
 
 # Edit these values directly when you want to run the file like a notebook.
-NOTEBOOK_DATASET_ID = "AMF_113_002__C640_C470" #"AMF_108_002__C640_C470"
-NOTEBOOK_BASE_DIR = "/Volumes/X9"  # dataserver_files/Group_Bausch/Tom_Dataserver/20260407
+NOTEBOOK_DATASET_ID = "AMF_105_002__C640_C470" #"AMF_113_002__C640_C470" #"AMF_108_002__C640_C470"
+NOTEBOOK_BASE_DIR = "/Volumes/dataserver_files/Group_Bausch/Tom_Dataserver/20260407"  # dataserver_files/Group_Bausch/Tom_Dataserver/20260407
 NOTEBOOK_VARIATION: str | None = None
 NOTEBOOK_FEATURE_COMMANDS = [
     "beads:compute=0,plot=0,overwrite=0",
-    "autocorr:compute=0,plot=1,overwrite=1",
+    "autocorr:compute=1,plot=1,overwrite=1",
     "image_corr:compute=0,plot=0,overwrite=0",
-    "vector_corr:compute=0,plot=1,overwrite=1",
+    "vector_corr:compute=0,plot=0,overwrite=0",
     "summary:compute=0,plot=0,overwrite=0",
 ]
 NOTEBOOK_ENABLE: list[str] = []
@@ -80,7 +82,7 @@ NOTEBOOK_RUN_ORDER: list[str] | None = None
 NOTEBOOK_BATCH_DATASET_IDS: list[str] = []
 NOTEBOOK_BATCH_BASE_DIRS: list[str] = []
 NOTEBOOK_COMPARISON_NAME: str | None = None
-NOTEBOOK_RUN_COMPARISON: bool = True
+NOTEBOOK_RUN_COMPARISON: bool = False
 
 # Short human-readable descriptions for each feature used in the printed
 # summary. These make it explicit what each feature computes and plots.
@@ -281,6 +283,37 @@ def _plot_autocorr_weighted_near0_profile(
             .sort_values("r_um")
         )
 
+    def _stored_fit_from_subset(subset: pd.DataFrame) -> dict[str, float] | None:
+        if not {"xi_um", "amp", "offset"}.issubset(subset.columns):
+            return None
+
+        xi_values = subset["xi_um"].to_numpy(dtype=float)
+        xi_values = xi_values[np.isfinite(xi_values)]
+        if not xi_values.size:
+            return None
+
+        xi_err_values = subset["xi_err_um"].to_numpy(dtype=float) if "xi_err_um" in subset.columns else np.array([], dtype=float)
+        xi_err_values = xi_err_values[np.isfinite(xi_err_values)] if xi_err_values.size else np.array([], dtype=float)
+
+        amp_values = subset["amp"].to_numpy(dtype=float)
+        amp_values = amp_values[np.isfinite(amp_values)]
+        offset_values = subset["offset"].to_numpy(dtype=float)
+        offset_values = offset_values[np.isfinite(offset_values)]
+        if not amp_values.size or not offset_values.size:
+            return None
+
+        return {
+            "xi": float(np.nanmedian(xi_values)),
+            "xi_err": float(np.nanmedian(xi_err_values)) if xi_err_values.size else np.nan,
+            "amp": float(np.nanmedian(amp_values)),
+            "offset": float(np.nanmedian(offset_values)),
+        }
+
+    def _exp_decay_local(x: np.ndarray, amplitude: float, xi: float, offset: float) -> np.ndarray:
+        x = np.asarray(x, dtype=float)
+        xi = max(float(xi), 1e-12)
+        return float(amplitude) * np.exp(-x / xi) + float(offset)
+
     has_frames = "frame" in df.columns and df["frame"].nunique(dropna=True) > 1
     x_series: list[np.ndarray] = []
     y_series: list[np.ndarray] = []
@@ -291,11 +324,17 @@ def _plot_autocorr_weighted_near0_profile(
         cmap = plt.get_cmap("viridis")
         colors = [cmap(value) for value in np.linspace(0.15, 0.95, max(1, len(frame_values)))]
         for frame, color in zip(frame_values, colors):
-            frame_profile = _profile_from_subset(df.loc[df["frame"] == frame])
+            frame_subset = df.loc[df["frame"] == frame]
+            frame_profile = _profile_from_subset(frame_subset)
             if frame_profile.empty:
                 continue
             x_data = frame_profile["r_um"].to_numpy(dtype=float)
             y_data = frame_profile["corr_median"].to_numpy(dtype=float)
+            time_minutes = None
+            if "time_s" in frame_subset.columns:
+                time_values = frame_subset["time_s"].dropna().astype(float)
+                if time_values.size:
+                    time_minutes = float(time_values.iloc[0]) / 60.0
             if x_range is not None:
                 lower, upper = x_range
                 mask = np.isfinite(x_data) & np.isfinite(y_data)
@@ -313,13 +352,15 @@ def _plot_autocorr_weighted_near0_profile(
             fit_df = frame_profile[frame_profile["r_um"] > 0].copy()
             r = fit_df["r_um"].to_numpy(dtype=float)
             y = fit_df["corr_median"].to_numpy(dtype=float)
-            label = f"frame {frame}"
-            if r.size >= 4 and y.size >= 4:
-                def _exp_decay_local(x: np.ndarray, amplitude: float, xi: float, offset: float) -> np.ndarray:
-                    x = np.asarray(x, dtype=float)
-                    xi = max(float(xi), 1e-12)
-                    return float(amplitude) * np.exp(-x / xi) + float(offset)
+            label = f"t={time_minutes:.2f} min" if time_minutes is not None else f"t={frame} min"
 
+            stored_fit = _stored_fit_from_subset(frame_subset)
+            if stored_fit is not None:
+                xi_label = _format_math_uncertainty_label(r"\xi", stored_fit["xi"], stored_fit["xi_err"], r"\mu\mathrm{m}")
+                label = f"t={time_minutes:.2f} min {xi_label}" if time_minutes is not None else f"t={frame} min {xi_label}"
+                x_fit = np.linspace(float(np.nanmin(x_data)), float(np.nanmax(x_data)), 240)
+                ax.plot(x_fit, _exp_decay_local(x_fit, stored_fit["amp"], stored_fit["xi"], stored_fit["offset"]), lw=1.4, ls="--", color=color, alpha=0.75)
+            elif r.size >= 4 and y.size >= 4:
                 amplitude_guess = max(1e-3, float(np.nanmax(y) - np.nanmin(y)))
                 xi_guess = max(0.1, float(np.nanmax(r)) / 8.0)
                 offset_guess = float(np.nanmin(y))
@@ -338,9 +379,9 @@ def _plot_autocorr_weighted_near0_profile(
                         maxfev=30000,
                     )
                     perr = np.sqrt(np.abs(np.diag(pcov))) if pcov is not None else np.full(popt.shape, np.nan)
-                    sigma_err = float(perr[1]) if perr.size > 1 and np.isfinite(perr[1]) else None
-                    sigma_label = _format_math_uncertainty_label(r"\sigma", float(popt[1]), sigma_err, r"\mu\mathrm{m}")
-                    label = f"frame {frame} {sigma_label}"
+                    xi_err = float(perr[1]) if perr.size > 1 and np.isfinite(perr[1]) else None
+                    xi_label = _format_math_uncertainty_label(r"\xi", float(popt[1]), xi_err, r"\mu\mathrm{m}")
+                    label = f"t={time_minutes:.2f} min {xi_label}" if time_minutes is not None else f"t={frame} min {xi_label}"
                     x_fit = np.linspace(float(np.nanmin(x_data)), float(np.nanmax(x_data)), 240)
                     ax.plot(x_fit, _exp_decay_local(x_fit, *popt), lw=1.4, ls="--", color=color, alpha=0.75)
                 except Exception:
@@ -376,59 +417,72 @@ def _plot_autocorr_weighted_near0_profile(
         source_line = ax.plot(x_data, y_data, "o", ms=3, alpha=0.85, label="median profile")[0]
 
     if not has_frames:
-        fit_df = profile[profile["r_um"] > 0].copy()
-        r = fit_df["r_um"].to_numpy(dtype=float)
-        y = fit_df["corr_median"].to_numpy(dtype=float)
-        if r.size < 4 or y.size < 4:
-            ax.set_title(title or "")
-            ax.text(0.5, 0.5, "no fit", ha="center", va="center", transform=ax.transAxes)
-            return
+        stored_fit = _stored_fit_from_subset(df)
+        if stored_fit is not None:
+            fit_color = source_line.get_color() if source_line is not None else "tab:blue"
+            x_fit_min = 0.0
+            x_fit_max = float(np.nanmax(profile["r_um"]))
+            if x_range is not None:
+                lower, upper = x_range
+                if lower is not None:
+                    x_fit_min = max(x_fit_min, float(lower))
+                if upper is not None:
+                    x_fit_max = min(x_fit_max, float(upper))
+            x_fit = np.linspace(x_fit_min, x_fit_max, 600)
+            y_fit = _exp_decay_local(x_fit, stored_fit["amp"], stored_fit["xi"], stored_fit["offset"])
+            ax.plot(x_fit, y_fit, lw=2, ls="--", color=fit_color, alpha=0.9)
+            xi_label = _format_math_uncertainty_label(r"\xi", stored_fit["xi"], stored_fit["xi_err"], r"\mu\mathrm{m}")
+            if source_line is not None:
+                source_line.set_label(f"median profile {xi_label}")
+        else:
+            fit_df = profile[profile["r_um"] > 0].copy()
+            r = fit_df["r_um"].to_numpy(dtype=float)
+            y = fit_df["corr_median"].to_numpy(dtype=float)
+            if r.size < 4 or y.size < 4:
+                ax.set_title(title or "")
+                ax.text(0.5, 0.5, "no fit", ha="center", va="center", transform=ax.transAxes)
+                return
 
-        def _exp_decay_local(x: np.ndarray, amplitude: float, xi: float, offset: float) -> np.ndarray:
-            x = np.asarray(x, dtype=float)
-            xi = max(float(xi), 1e-12)
-            return float(amplitude) * np.exp(-x / xi) + float(offset)
+            amplitude_guess = max(1e-3, float(np.nanmax(y) - np.nanmin(y)))
+            xi_guess = max(0.1, float(np.nanmax(r)) / 8.0)
+            offset_guess = float(np.nanmin(y))
+            alpha = 2.5 / max(float(np.nanmax(r)), 1e-6)
+            sigma_near0 = 0.2 + alpha * r
 
-        amplitude_guess = max(1e-3, float(np.nanmax(y) - np.nanmin(y)))
-        xi_guess = max(0.1, float(np.nanmax(r)) / 8.0)
-        offset_guess = float(np.nanmin(y))
-        alpha = 2.5 / max(float(np.nanmax(r)), 1e-6)
-        sigma_near0 = 0.2 + alpha * r
+            try:
+                popt, pcov = curve_fit(
+                    _exp_decay_local,
+                    r,
+                    y,
+                    p0=[amplitude_guess, xi_guess, offset_guess],
+                    bounds=([0.0, 0.01, -np.inf], [np.inf, np.inf, np.inf]),
+                    sigma=sigma_near0,
+                    absolute_sigma=False,
+                    maxfev=30000,
+                )
+                perr = np.sqrt(np.abs(np.diag(pcov))) if pcov is not None else np.full(popt.shape, np.nan)
+                sigma_err = float(perr[1]) if perr.size > 1 and np.isfinite(perr[1]) else None
+            except Exception:
+                ax.set_title(title or "")
+                ax.text(0.5, 0.5, "fit failed", ha="center", va="center", transform=ax.transAxes)
+                return
 
-        try:
-            popt, pcov = curve_fit(
-                _exp_decay_local,
-                r,
-                y,
-                p0=[amplitude_guess, xi_guess, offset_guess],
-                bounds=([0.0, 0.01, -np.inf], [np.inf, np.inf, np.inf]),
-                sigma=sigma_near0,
-                absolute_sigma=False,
-                maxfev=30000,
-            )
-            perr = np.sqrt(np.abs(np.diag(pcov))) if pcov is not None else np.full(popt.shape, np.nan)
-            sigma_err = float(perr[1]) if perr.size > 1 and np.isfinite(perr[1]) else None
-        except Exception:
-            ax.set_title(title or "")
-            ax.text(0.5, 0.5, "fit failed", ha="center", va="center", transform=ax.transAxes)
-            return
+            x_fit_min = 0.0
+            x_fit_max = float(np.nanmax(profile["r_um"]))
+            if x_range is not None:
+                lower, upper = x_range
+                if lower is not None:
+                    x_fit_min = max(x_fit_min, float(lower))
+                if upper is not None:
+                    x_fit_max = min(x_fit_max, float(upper))
+            x_fit = np.linspace(x_fit_min, x_fit_max, 600)
+            y_fit = _exp_decay_local(x_fit, *popt)
 
-        x_fit_min = 0.0
-        x_fit_max = float(np.nanmax(profile["r_um"]))
-        if x_range is not None:
-            lower, upper = x_range
-            if lower is not None:
-                x_fit_min = max(x_fit_min, float(lower))
-            if upper is not None:
-                x_fit_max = min(x_fit_max, float(upper))
-        x_fit = np.linspace(x_fit_min, x_fit_max, 600)
-        y_fit = _exp_decay_local(x_fit, *popt)
-
-        fit_color = source_line.get_color() if source_line is not None else "tab:blue"
-        ax.plot(x_fit, y_fit, lw=2, ls="--", color=fit_color, alpha=0.9)
-        sigma_label = _format_math_uncertainty_label(r"\sigma", float(popt[1]), sigma_err, r"\mu\mathrm{m}")
-        if source_line is not None:
-            source_line.set_label(f"median profile {sigma_label}")
+            fit_color = source_line.get_color() if source_line is not None else "tab:blue"
+            ax.plot(x_fit, y_fit, lw=2, ls="--", color=fit_color, alpha=0.9)
+            xi_label = _format_math_uncertainty_label(r"\xi", float(popt[1]), sigma_err, r"\mu\mathrm{m}")
+            if source_line is not None:
+                source_line.set_label(f"median profile {xi_label}")
 
     if title:
         ax.set_title(title)
@@ -826,14 +880,13 @@ def _comparison_specs_for_batch(
     variation: str | None = None,
 ) -> list[ComparisonSpec]:
     comparison_cfg = config.get("comparison", {}) if isinstance(config.get("comparison", {}), dict) else {}
+    comparison_cfg = resolve_comparison_preset(comparison_cfg)
     palette = str(comparison_cfg.get("palette", "atp"))
     registry_specs: list[ComparisonSpec] = []
-    registry = comparison_cfg.get("registry")
-    if isinstance(registry, list) and registry:
-        try:
-            registry_specs = build_comparison_specs(registry, palette=palette)
-        except Exception:
-            registry_specs = []
+    try:
+        registry_specs = comparison_registry_from_config(comparison_cfg)
+    except Exception:
+        registry_specs = []
 
     registry_map = {spec.dataset_id: spec for spec in registry_specs}
     default_colors = comparison_palette(palette, len(dataset_pairs))
@@ -869,6 +922,7 @@ def _comparison_dataset_pairs_from_config(
     default_base_dir: str,
 ) -> list[tuple[str, str]]:
     comparison_cfg = config.get("comparison", {}) if isinstance(config.get("comparison", {}), dict) else {}
+    comparison_cfg = resolve_comparison_preset(comparison_cfg)
     registry = comparison_cfg.get("registry")
     if not isinstance(registry, list) or not registry:
         return []
@@ -978,7 +1032,13 @@ def _plot_metric_bar(
     is_dark_background = float(facecolor.mean()) < 0.5
     error_color = "white" if is_dark_background else "black"
 
-    bars = ax.bar(x, y, width=0.68, color=colors, alpha=0.72, zorder=1, edgecolor="none")
+    bar_colors = colors
+    if "dataset_color" in ordered.columns:
+        dataset_colors = [str(value).strip() for value in ordered["dataset_color"].tolist()]
+        if all(color for color in dataset_colors):
+            bar_colors = dataset_colors
+
+    bars = ax.bar(x, y, width=0.68, color=bar_colors, alpha=0.72, zorder=1, edgecolor="none")
     for bar in bars:
         bar.set_zorder(1)
 
@@ -1085,6 +1145,79 @@ def _sampled_autocorr_length_time_series(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("time_s").reset_index(drop=True)
 
 
+def _plot_autocorr_length_time_series(
+    ax: Axes,
+    table: pd.DataFrame,
+    *,
+    title: str | None = None,
+    time_col: str = "time_s",
+    time_unit: str = "s",
+    use_log_x: bool = False,
+) -> None:
+    if table.empty or time_col not in table.columns or "xi_um" not in table.columns:
+        ax.set_title(title or "")
+        ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+        return
+
+    group_col = "dataset_order" if "dataset_order" in table.columns else None
+    groups = table.groupby(group_col, sort=True) if group_col is not None else [(None, table)]
+    x_series: list[np.ndarray] = []
+    y_series: list[np.ndarray] = []
+
+    for group_key, group_df in groups:
+        group_df = group_df.sort_values(time_col)
+        if group_df.empty:
+            continue
+
+        color = str(group_df["dataset_color"].iloc[0]) if "dataset_color" in group_df.columns else None
+        label = (
+            str(group_df["legend_label"].iloc[0])
+            if "legend_label" in group_df.columns
+            else str(group_df["dataset_label"].iloc[0])
+            if "dataset_label" in group_df.columns
+            else str(group_key) if group_key is not None else "sampled autocorr"
+        )
+
+        x = group_df[time_col].to_numpy(dtype=float)
+        y = group_df["xi_um"].to_numpy(dtype=float)
+        mask = np.isfinite(x) & np.isfinite(y)
+        if not np.any(mask):
+            continue
+        x = x[mask]
+        y = y[mask]
+        if use_log_x:
+            x = np.clip(x, np.finfo(float).tiny, None)
+
+        ax.plot(x, y, lw=2.0, color=color, label=label)
+        if "xi_err_um" in group_df.columns:
+            yerr = group_df["xi_err_um"].to_numpy(dtype=float)
+            yerr = yerr[mask]
+            err_mask = np.isfinite(yerr)
+            if np.any(err_mask):
+                lower = np.maximum(y[err_mask] - yerr[err_mask], np.finfo(float).tiny)
+                upper = y[err_mask] + yerr[err_mask]
+                ax.fill_between(x[err_mask], lower, upper, alpha=0.14, color=color, linewidth=0)
+
+        x_series.append(x)
+        y_series.append(y)
+
+    if title:
+        ax.set_title(title)
+    ax.set_xlabel(f"time ({time_unit})")
+    ax.set_ylabel(r"autocorr length ($\mu\mathrm{m}$)")
+    if use_log_x:
+        ax.set_xscale("log")
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=True)
+
+    x_limits = _finite_limits(x_series)
+    y_limits = _finite_limits(y_series)
+    if x_limits is not None:
+        ax.set_xlim(*x_limits)
+    if y_limits is not None:
+        ax.set_ylim(*y_limits)
+
+
 def _comparison_sort_key(spec: ComparisonSpec) -> tuple[float, str, str]:
     label = str(spec.label).strip()
     match = re.search(r"(-?\d+(?:\.\d+)?)\s*nM", label, flags=re.IGNORECASE)
@@ -1157,12 +1290,13 @@ def run_batch_comparison(
         series["dataset_order"] = int(dataset_order)
         series["dataset_color"] = spec.color
         series["legend_label"] = f"{spec.label} {velocity_label}"
-        velocity_parts.append(series[["time_s", "corr", "corr_std", "dataset_order", "legend_label"]])
+        velocity_parts.append(series[["time_s", "corr", "corr_std", "dataset_order", "dataset_color", "legend_label"]])
         speed_summary_rows.append(
             {
                 "dataset_id": spec.dataset_id,
                 "dataset_label": spec.label,
                 "dataset_order": int(dataset_order),
+                "dataset_color": spec.color,
                 "mean_speed_um_s": mean_value,
                 "speed_std_um_s": std_value,
             }
@@ -1222,7 +1356,7 @@ def run_batch_comparison(
 
     autocorr_cfg = dict(reference_cfg.get("autocorr", {}))
     autocorr_plot_range = _range_from_config(autocorr_cfg.get("plot_r_um_min"), autocorr_cfg.get("plot_r_um_max"))
-    autocorr_sigma_rows: list[dict[str, Any]] = []
+    autocorr_xi_rows: list[dict[str, Any]] = []
     autocorr_time_rows: list[dict[str, Any]] = []
     autocorr_maps = (
         ("single3d_df", "autocorr_3d_single_frame.parquet", "r_um", "3D autocorrelation, single frame"),
@@ -1250,13 +1384,14 @@ def run_batch_comparison(
                 if xi_values.size:
                     xi_err_values = collapsed["xi_err_um"].to_numpy(dtype=float) if "xi_err_um" in collapsed.columns else np.array([], dtype=float)
                     xi_err_values = xi_err_values[np.isfinite(xi_err_values)]
-                    autocorr_sigma_rows.append(
+                    autocorr_xi_rows.append(
                         {
                             "dataset_id": spec.dataset_id,
                             "dataset_label": spec.label,
                             "dataset_order": int(dataset_order),
-                            "sigma_um": float(np.nanmedian(xi_values)),
-                            "sigma_err_um": float(np.nanmedian(xi_err_values)) if xi_err_values.size else np.nan,
+                            "dataset_color": spec.color,
+                            "xi_um": float(np.nanmedian(xi_values)),
+                            "xi_err_um": float(np.nanmedian(xi_err_values)) if xi_err_values.size else np.nan,
                         }
                     )
 
@@ -1283,7 +1418,7 @@ def run_batch_comparison(
                 fit_error_col="xi_err_um",
                 fit_amplitude_col="amp",
                 fit_offset_col="offset",
-                fit_symbol=r"\sigma",
+                fit_symbol=r"\xi",
                 fit_unit=r"\mu\mathrm{m}",
                 fit_label_formatter=lambda label, value, error, symbol, unit: f"{label} {_format_math_uncertainty_label(symbol, value, error, unit)}",
             )
@@ -1301,7 +1436,7 @@ def run_batch_comparison(
                     fit_error_col="xi_err_um",
                     fit_amplitude_col="amp",
                     fit_offset_col="offset",
-                    fit_symbol=r"\sigma",
+                    fit_symbol=r"\xi",
                     fit_unit=r"\mu\mathrm{m}",
                     fit_label_formatter=lambda label, value, error, symbol, unit: f"{label} {_format_math_uncertainty_label(symbol, value, error, unit)}",
                 )
@@ -1338,49 +1473,7 @@ def run_batch_comparison(
         time_cmp = pd.concat(time_parts, ignore_index=True).sort_values(["dataset_order", "time_s"]).reset_index(drop=True)
         with comparison_style_context("dark"):
             fig, ax = plt.subplots(figsize=(8.0, 4.8), dpi=150)
-            for dataset_order, dataset_df in time_cmp.groupby("dataset_order", sort=True):
-                dataset_df = dataset_df.sort_values("time_s")
-                if dataset_df.empty:
-                    continue
-                color = str(dataset_df["dataset_color"].iloc[0]) if "dataset_color" in dataset_df.columns else None
-                label = str(dataset_df["legend_label"].iloc[0]) if "legend_label" in dataset_df.columns else str(dataset_order)
-                x = dataset_df["time_s"].to_numpy(dtype=float)
-                y = dataset_df["xi_um"].to_numpy(dtype=float)
-                ax.plot(x, y, lw=2.0, color=color, label=label)
-                if "xi_err_um" in dataset_df.columns:
-                    yerr = dataset_df["xi_err_um"].to_numpy(dtype=float)
-                    mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(yerr)
-                    if np.any(mask):
-                        lower = np.maximum(y[mask] - yerr[mask], np.finfo(float).tiny)
-                        upper = y[mask] + yerr[mask]
-                        ax.fill_between(x[mask], lower, upper, alpha=0.14, color=color, linewidth=0)
-            ax.set_title(f"{title} comparison")
-            ax.set_xlabel("time (s)")
-            ax.set_ylabel(r"autocorr length ($\mu\mathrm{m}$)")
-            ax.set_yscale("log")
-            y_positive = time_cmp["xi_um"].to_numpy(dtype=float)
-            y_positive = y_positive[np.isfinite(y_positive) & (y_positive > 0)]
-            if y_positive.size:
-                y_min = float(np.nanmin(y_positive))
-                y_max = float(np.nanmax(y_positive))
-                if np.isclose(y_min, y_max):
-                    ax.set_ylim(max(y_min * 0.8, np.finfo(float).tiny), y_max * 1.2)
-                else:
-                    ax.set_ylim(max(y_min * 0.8, np.finfo(float).tiny), y_max * 1.2)
-            x_all = time_cmp["time_s"].to_numpy(dtype=float)
-            x_all = x_all[np.isfinite(x_all)]
-            if x_all.size:
-                x_min = float(np.nanmin(x_all))
-                x_max = float(np.nanmax(x_all))
-                if np.isclose(x_min, x_max):
-                    ax.set_xlim(x_min - 0.5, x_max + 0.5)
-                else:
-                    pad = 0.05 * (x_max - x_min)
-                    ax.set_xlim(x_min - pad, x_max + pad)
-            ax.grid(True, alpha=0.25)
-            ax.legend(frameon=True)
-
-            def _white_time(ax_white: Axes, table=time_cmp) -> None:
+            def _plot_time_series(ax_target: Axes, table: pd.DataFrame, *, use_log: bool) -> None:
                 for dataset_order, dataset_df in table.groupby("dataset_order", sort=True):
                     dataset_df = dataset_df.sort_values("time_s")
                     if dataset_df.empty:
@@ -1389,65 +1482,76 @@ def run_batch_comparison(
                     label = str(dataset_df["legend_label"].iloc[0]) if "legend_label" in dataset_df.columns else str(dataset_order)
                     x = dataset_df["time_s"].to_numpy(dtype=float)
                     y = dataset_df["xi_um"].to_numpy(dtype=float)
-                    ax_white.plot(x, y, lw=2.0, color=color, label=label)
+                    ax_target.plot(x, y, lw=2.0, color=color, label=label)
                     if "xi_err_um" in dataset_df.columns:
                         yerr = dataset_df["xi_err_um"].to_numpy(dtype=float)
                         mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(yerr)
                         if np.any(mask):
                             lower = np.maximum(y[mask] - yerr[mask], np.finfo(float).tiny)
                             upper = y[mask] + yerr[mask]
-                            ax_white.fill_between(x[mask], lower, upper, alpha=0.14, color=color, linewidth=0)
-                ax_white.set_xlabel("time (s)")
-                ax_white.set_ylabel(r"autocorr length ($\mu\mathrm{m}$)")
-                ax_white.set_yscale("log")
-                y_positive = table["xi_um"].to_numpy(dtype=float)
-                y_positive = y_positive[np.isfinite(y_positive) & (y_positive > 0)]
-                if y_positive.size:
-                    y_min = float(np.nanmin(y_positive))
-                    y_max = float(np.nanmax(y_positive))
-                    ax_white.set_ylim(max(y_min * 0.8, np.finfo(float).tiny), y_max * 1.2)
+                            ax_target.fill_between(x[mask], lower, upper, alpha=0.14, color=color, linewidth=0)
+                ax_target.set_xlabel("time (s)")
+                ax_target.set_ylabel(r"autocorr length ($\mu\mathrm{m}$)")
+                if use_log:
+                    ax_target.set_yscale("log")
+                y_values = table["xi_um"].to_numpy(dtype=float)
+                y_values = y_values[np.isfinite(y_values)]
+                if y_values.size:
+                    y_min = float(np.nanmin(y_values))
+                    y_max = float(np.nanmax(y_values))
+                    if use_log:
+                        ax_target.set_ylim(max(y_min * 0.8, np.finfo(float).tiny), y_max * 1.2)
+                    else:
+                        y_pad = 0.08 * (y_max - y_min) if not np.isclose(y_min, y_max) else max(abs(y_min) * 0.1, 0.5)
+                        ax_target.set_ylim(y_min - y_pad, y_max + y_pad)
                 x_all = table["time_s"].to_numpy(dtype=float)
                 x_all = x_all[np.isfinite(x_all)]
                 if x_all.size:
                     x_min = float(np.nanmin(x_all))
                     x_max = float(np.nanmax(x_all))
                     if np.isclose(x_min, x_max):
-                        ax_white.set_xlim(x_min - 0.5, x_max + 0.5)
+                        ax_target.set_xlim(x_min - 0.5, x_max + 0.5)
                     else:
                         pad = 0.05 * (x_max - x_min)
-                        ax_white.set_xlim(x_min - pad, x_max + pad)
-                ax_white.grid(True, alpha=0.25)
-                ax_white.legend(frameon=True)
+                        ax_target.set_xlim(x_min - pad, x_max + pad)
+                ax_target.grid(True, alpha=0.25)
+                ax_target.legend(frameon=True)
+
+            _plot_time_series(ax, time_cmp, use_log=True)
+            ax.set_title(f"{title} comparison")
+
+            def _white_time(ax_white: Axes, table=time_cmp) -> None:
+                _plot_time_series(ax_white, table, use_log=True)
 
             stem = f"{comparison_name}_{key}_autocorr_length_over_time"
             saved[stem] = save_comparison_dual_pdf(fig, out_dir, stem, white_plot_fn=_white_time)
             plt.close(fig)
 
-    if autocorr_sigma_rows:
-        sigma_df = pd.DataFrame(autocorr_sigma_rows).drop_duplicates(subset=["dataset_id"], keep="last")
+    if autocorr_xi_rows:
+        xi_df = pd.DataFrame(autocorr_xi_rows).drop_duplicates(subset=["dataset_id"], keep="last")
         with comparison_style_context("dark"):
             fig, ax = plt.subplots(figsize=(7.4, 4.8), dpi=150)
             _plot_metric_bar(
                 ax,
-                sigma_df,
-                value_col="sigma_um",
-                error_col="sigma_err_um",
-                ylabel=r"$\sigma$ ($\mu\mathrm{m}$)",
-                title="Autocorrelation sigma summary",
+                xi_df,
+                value_col="xi_um",
+                error_col="xi_err_um",
+                ylabel=r"$\xi$ ($\mu\mathrm{m}$)",
+                title="Autocorrelation xi summary",
             )
 
-            def _white_sigma_summary(ax_white: Axes, table=sigma_df) -> None:
+            def _white_xi_summary(ax_white: Axes, table=xi_df) -> None:
                 _plot_metric_bar(
                     ax_white,
                     table,
-                    value_col="sigma_um",
-                    error_col="sigma_err_um",
-                    ylabel=r"$\sigma$ ($\mu\mathrm{m}$)",
+                    value_col="xi_um",
+                    error_col="xi_err_um",
+                    ylabel=r"$\xi$ ($\mu\mathrm{m}$)",
                     title=None,
                 )
 
-            stem = f"{comparison_name}_autocorr_sigma_summary"
-            saved[stem] = save_comparison_dual_pdf(fig, out_dir, stem, white_plot_fn=_white_sigma_summary)
+            stem = f"{comparison_name}_autocorr_xi_summary"
+            saved[stem] = save_comparison_dual_pdf(fig, out_dir, stem, white_plot_fn=_white_xi_summary)
             plt.close(fig)
 
     # Image correlation comparison.
@@ -1623,6 +1727,7 @@ def run_batch_comparison(
 
             color = spec.color
             legend_label = spec.label
+            signal_variance = float(np.nanvar(y, ddof=0)) if y.size else float("nan")
 
             if "corr_sem" in grouped.columns:
                 yerr = grouped["corr_sem"].to_numpy(dtype=float)
@@ -1644,11 +1749,13 @@ def run_batch_comparison(
                 if fit_xi is not None and np.isfinite(fit_xi):
                     xi_label = _format_math_uncertainty_label(r"\xi", fit_xi, fit_xi_err, r"\mu\mathrm{m}")
                     legend_label = f"{spec.label} {xi_label}"
+            elif str(component_pair).lower() == "xy" and np.isfinite(signal_variance):
+                legend_label = f"{spec.label} var={signal_variance:.3g}"
 
-                if fit_popt is not None and np.isfinite(x).any():
-                    finite_x = x[np.isfinite(x)]
-                    x_fit = np.linspace(float(np.nanmin(finite_x)), float(np.nanmax(finite_x)), 250)
-                    ax.plot(x_fit, _exp_decay(x_fit, *fit_popt), ls="--", lw=1.4, color=color, alpha=0.85, label="_nolegend_")
+            if fit_popt is not None and np.isfinite(x).any():
+                finite_x = x[np.isfinite(x)]
+                x_fit = np.linspace(float(np.nanmin(finite_x)), float(np.nanmax(finite_x)), 250)
+                ax.plot(x_fit, _exp_decay(x_fit, *fit_popt), ls="--", lw=1.4, color=color, alpha=0.85, label="_nolegend_")
 
             ax.plot(x, y, lw=1.8, color=color, label=legend_label)
 
@@ -2134,6 +2241,49 @@ class AnalysisNotebookRunner:
                     save_comparison_dual_pdf(fig, plot_dir, f"{state['dataset_id']}_{stem}", white_plot_fn=_white)
                     plt.close(fig)
 
+                for key, stem, title in (
+                    ("sampled3d_df", "autocorr_3d_sampled_length_over_time_linear", "3D autocorrelation length over time"),
+                    ("sampled2d_df", "autocorr_2d_sampled_length_over_time_linear", "2D autocorrelation length over time"),
+                ):
+                    df = result.get(key, pd.DataFrame())
+                    if df is None or df.empty:
+                        continue
+                    summary = _sampled_autocorr_length_time_series(df)
+                    if summary.empty:
+                        continue
+                    summary = summary.copy()
+                    summary["time_min"] = summary["time_s"].astype(float) / 60.0
+                    summary["dataset_label"] = "sampled autocorr length"
+                    summary["legend_label"] = "sampled autocorr length"
+                    summary["dataset_color"] = comparison_palette("tab10", 1)[0]
+                    fig, ax = plt.subplots(figsize=(7.4, 4.8), dpi=150)
+                    _plot_autocorr_length_time_series(
+                        ax,
+                        summary,
+                        title=title,
+                        time_col="time_min",
+                        time_unit="min",
+                        use_log_x=False,
+                    )
+
+                    def _white_time(ax_white: Axes, table=summary, plot_title=title) -> None:
+                        _plot_autocorr_length_time_series(
+                            ax_white,
+                            table,
+                            title=None,
+                            time_col="time_min",
+                            time_unit="min",
+                            use_log_x=False,
+                        )
+
+                    save_comparison_dual_pdf(
+                        fig,
+                        plot_dir,
+                        f"{state['dataset_id']}_{stem}",
+                        white_plot_fn=_white_time,
+                    )
+                    plt.close(fig)
+
         self.outputs["autocorr"] = result
         return result
 
@@ -2553,6 +2703,7 @@ def main(argv: list[str] | None = None) -> Any:
     if dataset_ids or (comparison_enabled and not notebook_dataset_id):
         cfg_for_comparison = load_analysis_config(str(args.config))
         comparison_cfg = cfg_for_comparison.get("comparison", {}) if isinstance(cfg_for_comparison.get("comparison", {}), dict) else {}
+        comparison_cfg = resolve_comparison_preset(comparison_cfg)
         apply_feature_commands_to_single_datasets = bool(comparison_cfg.get("apply_notebook_feature_commands_to_single_datasets", True))
         comparison_name = args.comparison_name or NOTEBOOK_COMPARISON_NAME or str(comparison_cfg.get("name", "batch_comparison"))
         comparison_output_root = str(comparison_cfg.get("output_root", "plots/comparisons"))

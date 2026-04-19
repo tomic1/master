@@ -97,6 +97,8 @@ def comparison_registry_from_config(comparison_cfg: dict[str, Any]) -> list[Comp
     if not comparison_cfg.get("enabled", False):
         return []
 
+    comparison_cfg = resolve_comparison_preset(comparison_cfg)
+
     default_palette = str(comparison_cfg.get("palette", "atp"))
     default_variation = str(comparison_cfg.get("variation", "")).strip()
     registry = comparison_cfg.get("registry")
@@ -143,6 +145,22 @@ def comparison_registry_from_config(comparison_cfg: dict[str, Any]) -> list[Comp
             )
 
     return build_comparison_specs(flat_entries, palette=default_palette)
+
+
+def resolve_comparison_preset(comparison_cfg: dict[str, Any]) -> dict[str, Any]:
+    selected = str(comparison_cfg.get("selected", "")).strip()
+    presets = comparison_cfg.get("presets")
+    if not selected or not isinstance(presets, dict):
+        return comparison_cfg
+
+    preset = presets.get(selected)
+    if not isinstance(preset, dict):
+        return comparison_cfg
+
+    resolved = dict(comparison_cfg)
+    resolved.update(preset)
+    resolved["selected"] = selected
+    return resolved
 
 
 def build_comparison_specs(
