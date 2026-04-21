@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Sequence
 import numpy as np
 import pandas as pd
 from scipy.spatial import KDTree
+from scipy.optimize import curve_fit
 from tqdm import tqdm
 
 
@@ -50,7 +51,12 @@ def _velocity_source(vector_cfg: Dict[str, Any]) -> str:
     raise ValueError(f"Unknown velocity_source: {source!r}")
 
 
-def _velocity_output_name(base_name: str, vector_cfg: Dict[str, Any], distance_mode: str | None = None) -> str:
+def _velocity_output_name(
+    base_name: str,
+    vector_cfg: Dict[str, Any],
+    distance_mode: str | None = None,
+    tensor_basis: str | None = None,
+) -> str:
     suffixes: list[str] = []
     source = _velocity_source(vector_cfg)
     if source != "raw":
@@ -60,9 +66,74 @@ def _velocity_output_name(base_name: str, vector_cfg: Dict[str, Any], distance_m
         suffixes.append(outlier_suffix)
     if distance_mode and distance_mode != "xyz":
         suffixes.append(distance_mode)
+    basis = _tensor_basis_name(tensor_basis)
+    if basis != "cartesian":
+        suffixes.append(basis)
     if not suffixes:
         return base_name
     return base_name.replace(".parquet", f"_{'_'.join(suffixes)}.parquet")
+
+
+def _tensor_basis_name(tensor_basis: str | None) -> str:
+    basis = str(tensor_basis or "cartesian").strip().lower()
+    if basis in {"cartesian", "cart", "xyz"}:
+        return "cartesian"
+    if basis in {"spherical", "pair_aligned", "pair-aligned", "aligned", "local"}:
+        return "spherical"
+    raise ValueError(f"Unknown tensor_basis: {tensor_basis!r}")
+
+
+def _tensor_basis_component_names(tensor_basis: str | None) -> tuple[str, str, str]:
+    basis = _tensor_basis_name(tensor_basis)
+    if basis == "cartesian":
+        return "x", "y", "z"
+    return "r", "theta", "phi"
+
+
+def _pair_aligned_basis(displacements: np.ndarray) -> np.ndarray:
+    displacements = np.asarray(displacements, dtype=float)
+    norms = np.linalg.norm(displacements, axis=1)
+    valid = np.isfinite(norms) & (norms > 0.0)
+    if not np.any(valid):
+        return np.empty((0, 3, 3), dtype=float)
+
+    unit_r = displacements[valid] / norms[valid, None]
+    references = np.zeros_like(unit_r)
+    references[:, 2] = 1.0
+    near_pole = np.abs(unit_r[:, 2]) > 0.9
+    references[near_pole] = np.array([0.0, 1.0, 0.0])
+
+    unit_theta = np.cross(references, unit_r)
+    theta_norm = np.linalg.norm(unit_theta, axis=1)
+    theta_norm = np.where(theta_norm > 0.0, theta_norm, 1.0)
+    unit_theta = unit_theta / theta_norm[:, None]
+
+    unit_phi = np.cross(unit_r, unit_theta)
+    phi_norm = np.linalg.norm(unit_phi, axis=1)
+    phi_norm = np.where(phi_norm > 0.0, phi_norm, 1.0)
+    unit_phi = unit_phi / phi_norm[:, None]
+
+    return np.stack([unit_r, unit_theta, unit_phi], axis=1)
+
+
+def _project_tensor_vectors(
+    left_vec: np.ndarray,
+    right_vec: np.ndarray,
+    left_pos: np.ndarray,
+    right_pos: np.ndarray,
+    tensor_basis: str | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    basis = _tensor_basis_name(tensor_basis)
+    if basis == "cartesian":
+        return left_vec, right_vec
+
+    basis_mats = _pair_aligned_basis(right_pos - left_pos)
+    if basis_mats.size == 0:
+        return np.empty((0, 3), dtype=float), np.empty((0, 3), dtype=float)
+
+    left_proj = np.einsum("nij,nj->ni", basis_mats, left_vec)
+    right_proj = np.einsum("nij,nj->ni", basis_mats, right_vec)
+    return left_proj, right_proj
 
 
 def _velocity_outlier_suffix(vector_cfg: Dict[str, Any]) -> str | None:
@@ -223,6 +294,72 @@ def _frame_seconds(state: Dict[str, Any]) -> float:
     return 1.0
 
 
+def _temporal_exp_decay(x: np.ndarray, amplitude: float, tau: float, offset: float) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    tau = max(float(tau), 1e-12)
+    return float(amplitude) * np.exp(-np.clip(x, 0.0, None) / tau) + float(offset)
+
+
+def _fit_temporal_decay_profile(
+    df: pd.DataFrame,
+    *,
+    fit_range: tuple[float | None, float | None] | None = None,
+    min_points: int = 4,
+) -> tuple[np.ndarray | None, float | None, float | None]:
+    if df.empty or "lag_s" not in df.columns or "corr" not in df.columns:
+        return None, None, None
+
+    grouped = df.dropna(subset=["lag_s", "corr"]).groupby("lag_s", as_index=False).agg(corr=("corr", "mean"), corr_std=("corr", "std"))
+    grouped["corr_std"] = grouped["corr_std"].fillna(0.0)
+    if grouped.empty:
+        return None, None, None
+
+    x = grouped["lag_s"].to_numpy(dtype=float)
+    y = grouped["corr"].to_numpy(dtype=float)
+    yerr = grouped["corr_std"].to_numpy(dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y) & (x > 0)
+    if fit_range is not None:
+        lower, upper = fit_range
+        if lower is not None:
+            mask &= x >= float(lower)
+        if upper is not None:
+            mask &= x <= float(upper)
+    mask &= np.isfinite(yerr)
+
+    if int(mask.sum()) < int(min_points):
+        return None, None, None
+
+    x_fit = x[mask]
+    y_fit = y[mask]
+    sigma = np.clip(yerr[mask], 1e-12, None)
+
+    offset_guess = float(np.nanmean(y_fit[-max(3, y_fit.size // 5) :])) if y_fit.size else 0.0
+    if not np.isfinite(offset_guess):
+        offset_guess = 0.0
+    amplitude_guess = float(y_fit[0] - offset_guess) if y_fit.size else 1.0
+    if not np.isfinite(amplitude_guess) or amplitude_guess == 0.0:
+        centered = y_fit - offset_guess
+        amplitude_guess = float(centered[np.nanargmax(np.abs(centered))]) if centered.size else 1.0
+    tau_guess = max(1e-3, float(np.nanmedian(x_fit)))
+
+    try:
+        popt, pcov = curve_fit(
+            _temporal_exp_decay,
+            x_fit,
+            y_fit,
+            p0=[amplitude_guess, tau_guess, offset_guess],
+            bounds=([-np.inf, 1e-12, -np.inf], [np.inf, np.inf, np.inf]),
+            sigma=sigma,
+            absolute_sigma=True,
+            maxfev=20000,
+        )
+        perr = np.sqrt(np.abs(np.diag(pcov))) if pcov is not None else np.full(popt.shape, np.nan)
+        return popt, float(popt[1]), float(perr[1]) if perr.size > 1 else np.nan
+    except Exception:
+        return None, None, None
+
+
 def _unit_vectors_from_df(df: pd.DataFrame, use_unit_vectors: bool, velocity_source: str = "raw") -> np.ndarray:
     vx_col, vy_col, vz_col = _velocity_column_names(df, velocity_source)
     vec = np.column_stack(
@@ -363,6 +500,22 @@ def compute_temporal_single_vector_correlation(
     out_df["lag_s"] = out_df["lag_frames"].astype(float) * float(lag_step_s)
     out_df["velocity_source"] = velocity_source
 
+    fit_range = (
+        vector_cfg.get("temporal_fit_lag_s_min"),
+        vector_cfg.get("temporal_fit_lag_s_max"),
+    )
+    fit_range = None if fit_range == (None, None) else fit_range
+    fit_popt, fit_tau, fit_tau_err = _fit_temporal_decay_profile(out_df, fit_range=fit_range, min_points=4)
+    out_df["tau_str_s"] = np.nan
+    out_df["tau_err_s"] = np.nan
+    out_df["amp"] = np.nan
+    out_df["offset"] = np.nan
+    if fit_popt is not None and fit_tau is not None:
+        out_df["tau_str_s"] = float(fit_tau)
+        out_df["tau_err_s"] = float(fit_tau_err) if fit_tau_err is not None and np.isfinite(fit_tau_err) else np.nan
+        out_df["amp"] = float(fit_popt[0])
+        out_df["offset"] = float(fit_popt[2])
+
     out_df.to_parquet(out_path, index=False)
     print(f"Saved temporal vector correlation to {out_path}")
     return out_df
@@ -464,6 +617,7 @@ def _accumulate_spatial_tensor_frame(
     velocity_source: str,
     use_unit_vectors: bool,
     distance_mode: str,
+    tensor_basis: str,
 ) -> pd.DataFrame | None:
     if len(frame_df) < 2:
         return None
@@ -527,6 +681,12 @@ def _accumulate_spatial_tensor_frame(
     distances = distances[valid_vectors]
     left_vec = left_vec[valid_vectors]
     right_vec = right_vec[valid_vectors]
+    left_pos = pos[pairs[valid_pairs, 0]][valid_vectors]
+    right_pos = pos[pairs[valid_pairs, 1]][valid_vectors]
+    left_vec, right_vec = _project_tensor_vectors(left_vec, right_vec, left_pos, right_pos, tensor_basis)
+    if left_vec.size == 0 or right_vec.size == 0:
+        return None
+
     pair_tensors = left_vec[:, :, None] * right_vec[:, None, :]
     if pair_tensors.size == 0:
         return None
@@ -539,7 +699,7 @@ def _accumulate_spatial_tensor_frame(
     bin_index = bin_index[keep]
     pair_tensors = pair_tensors[keep]
 
-    component_names = ("x", "y", "z")
+    component_names = _tensor_basis_component_names(tensor_basis)
     rows: list[dict[str, Any]] = []
     for bin_id in range(len(bin_edges) - 1):
         bin_mask = bin_index == bin_id
@@ -564,6 +724,7 @@ def _accumulate_spatial_tensor_frame(
                             "col_component": col_name,
                             "component_pair": f"{row_name}{col_name}",
                             "part": part_name,
+                            "tensor_basis": _tensor_basis_name(tensor_basis),
                             "corr": float(tensor[row_index, col_index]),
                             "n_pairs": n_pairs,
                         }
@@ -595,6 +756,17 @@ def _select_frame_sample(frame_ids: list[int], start_index: int, sample_count: i
 
     sample_idx = np.linspace(0, len(candidate_frames) - 1, sample_count, dtype=int)
     return [candidate_frames[index] for index in np.unique(sample_idx)]
+
+
+def _select_frame_prefix(frame_ids: list[int], sample_count: int | None) -> list[int]:
+    if not frame_ids:
+        return []
+
+    if sample_count is None:
+        return list(frame_ids)
+
+    sample_count = max(1, int(sample_count))
+    return list(frame_ids[:sample_count])
 
 
 def _tensor_distance_mode(vector_cfg: Dict[str, Any]) -> str:
@@ -772,6 +944,7 @@ def _accumulate_spatial_tensor_profile_frame(
     velocity_source: str,
     use_unit_vectors: bool,
     distance_mode: str,
+    tensor_basis: str,
 ) -> pd.DataFrame | None:
     if len(frame_df) < 2:
         return None
@@ -835,6 +1008,12 @@ def _accumulate_spatial_tensor_profile_frame(
     distances = distances[valid_vectors]
     left_vec = left_vec[valid_vectors]
     right_vec = right_vec[valid_vectors]
+    left_pos = pos[pairs[valid_pairs, 0]][valid_vectors]
+    right_pos = pos[pairs[valid_pairs, 1]][valid_vectors]
+    left_vec, right_vec = _project_tensor_vectors(left_vec, right_vec, left_pos, right_pos, tensor_basis)
+    if left_vec.size == 0 or right_vec.size == 0:
+        return None
+
     pair_tensors = left_vec[:, :, None] * right_vec[:, None, :]
     if pair_tensors.size == 0:
         return None
@@ -846,7 +1025,7 @@ def _accumulate_spatial_tensor_profile_frame(
 
     bin_index = bin_index[keep]
     pair_tensors = pair_tensors[keep]
-    component_names = ("x", "y", "z")
+    component_names = _tensor_basis_component_names(tensor_basis)
     rows: list[dict[str, Any]] = []
 
     for bin_id in range(len(bin_edges) - 1):
@@ -879,6 +1058,7 @@ def _accumulate_spatial_tensor_profile_frame(
                             "col_component": col_name,
                             "component_pair": f"{row_name}{col_name}",
                             "part": part_name,
+                            "tensor_basis": _tensor_basis_name(tensor_basis),
                             "distance_mode": distance_mode,
                             "velocity_source": velocity_source,
                             "corr": corr,
@@ -898,15 +1078,18 @@ def compute_spatial_vector_tensor_correlation(
     vector_cfg: Dict[str, Any],
     skip_existing: bool = True,
     prepared_df: pd.DataFrame | None = None,
+    tensor_basis: str = "cartesian",
 ) -> pd.DataFrame:
     derived_dir = state["paths"]["derived_dir"]
     multi_frame_average = bool(vector_cfg.get("multi_frame_average", False))
     velocity_source = _velocity_source(vector_cfg)
     distance_mode = _tensor_distance_mode(vector_cfg)
+    tensor_basis = _tensor_basis_name(tensor_basis)
     out_name = _velocity_output_name(
         "beads_vector_correlation_tensor_avg.parquet" if multi_frame_average else "beads_vector_correlation_tensor.parquet",
         vector_cfg,
         distance_mode=distance_mode,
+        tensor_basis=tensor_basis,
     )
     out_path = os.path.join(derived_dir, out_name)
 
@@ -943,7 +1126,7 @@ def compute_spatial_vector_tensor_correlation(
 
     frame_ids = df["frame"].dropna().astype(int).unique().tolist()
     if not frame_ids:
-        out_df = pd.DataFrame(columns=["dataset_id", "frame", "distance_um", "row_component", "col_component", "component_pair", "part", "distance_mode", "velocity_source", "corr", "n_pairs"])
+        out_df = pd.DataFrame(columns=["dataset_id", "frame", "distance_um", "row_component", "col_component", "component_pair", "part", "tensor_basis", "distance_mode", "velocity_source", "corr", "n_pairs"])
         out_df.to_parquet(out_path, index=False)
         return out_df
 
@@ -960,12 +1143,13 @@ def compute_spatial_vector_tensor_correlation(
                 velocity_source,
                 use_unit_vectors,
                 distance_mode,
+                tensor_basis,
             )
             for candidate_frame in selected_frames
         ]
         frame_profiles = [profile for profile in frame_profiles if profile is not None and not profile.empty]
         if not frame_profiles:
-            out_df = pd.DataFrame(columns=["dataset_id", "frame", "distance_um", "row_component", "col_component", "component_pair", "part", "distance_mode", "velocity_source", "corr", "corr_sem", "n_pairs", "frame_count"])
+            out_df = pd.DataFrame(columns=["dataset_id", "frame", "distance_um", "row_component", "col_component", "component_pair", "part", "tensor_basis", "distance_mode", "velocity_source", "corr", "corr_sem", "n_pairs", "frame_count"])
             out_df.to_parquet(out_path, index=False)
             return out_df
 
@@ -976,6 +1160,7 @@ def compute_spatial_vector_tensor_correlation(
         out_df["frame"] = -1
         out_df["dataset_id"] = state["dataset_id"]
         out_df["mode"] = "dot"
+        out_df["tensor_basis"] = tensor_basis
         out_df["distance_mode"] = distance_mode
         out_df["velocity_source"] = velocity_source
         out_df = out_df.sort_values(["part", "component_pair", "distance_um"], kind="mergesort").reset_index(drop=True)
@@ -985,13 +1170,13 @@ def compute_spatial_vector_tensor_correlation(
         selected_frame = None
         for candidate_frame in candidate_frames:
             frame_df = df.loc[df["frame"] == candidate_frame].copy()
-            out_df = _accumulate_spatial_tensor_frame(frame_df, bin_edges, max_radius_um, state["dataset_id"], velocity_source, use_unit_vectors, distance_mode)
+            out_df = _accumulate_spatial_tensor_frame(frame_df, bin_edges, max_radius_um, state["dataset_id"], velocity_source, use_unit_vectors, distance_mode, tensor_basis)
             if out_df is not None and not out_df.empty:
                 selected_frame = candidate_frame
                 break
 
         if out_df is None or out_df.empty:
-            out_df = pd.DataFrame(columns=["dataset_id", "frame", "distance_um", "row_component", "col_component", "component_pair", "part", "distance_mode", "velocity_source", "corr", "n_pairs"])
+            out_df = pd.DataFrame(columns=["dataset_id", "frame", "distance_um", "row_component", "col_component", "component_pair", "part", "tensor_basis", "distance_mode", "velocity_source", "corr", "n_pairs"])
             out_df.to_parquet(out_path, index=False)
             return out_df
 
@@ -1001,9 +1186,99 @@ def compute_spatial_vector_tensor_correlation(
 
         out_df["distance_mode"] = distance_mode
         out_df["velocity_source"] = velocity_source
+        out_df["tensor_basis"] = tensor_basis
 
     out_df.to_parquet(out_path, index=False)
-    print(f"Saved spatial vector tensor correlation to {out_path}")
+    print(f"Saved spatial vector tensor correlation ({tensor_basis}) to {out_path}")
+    return out_df
+
+
+def compute_spatial_vector_tensor_time_series(
+    state: Dict[str, Any],
+    vel_df: pd.DataFrame,
+    vector_cfg: Dict[str, Any],
+    skip_existing: bool = True,
+    prepared_df: pd.DataFrame | None = None,
+    tensor_basis: str = "cartesian",
+) -> pd.DataFrame:
+    derived_dir = state["paths"]["derived_dir"]
+    velocity_source = _velocity_source(vector_cfg)
+    distance_mode = _tensor_distance_mode(vector_cfg)
+    tensor_basis = _tensor_basis_name(tensor_basis)
+    out_path = os.path.join(
+        derived_dir,
+        _velocity_output_name("beads_vector_correlation_tensor_time_series.parquet", vector_cfg, distance_mode=distance_mode, tensor_basis=tensor_basis),
+    )
+
+    if skip_existing and os.path.exists(out_path):
+        print("Loaded existing spatial tensor time series correlation from disk")
+        return pd.read_parquet(out_path)
+
+    if vel_df is None or len(vel_df) == 0:
+        raise ValueError("vel_df is empty")
+    if "frame" not in vel_df.columns:
+        raise ValueError("vel_df must contain a frame column")
+
+    df = prepared_df.copy() if prepared_df is not None else _prepare_velocity_dataframe(vel_df, vector_cfg, velocity_source)
+    df["frame"] = df["frame"].astype(int)
+
+    frame_ids = sorted(df["frame"].dropna().astype(int).unique().tolist())
+    sample_count = int(vector_cfg.get("tensor_time_series_sample_count", 3))
+    selected_frames = _select_frame_prefix(frame_ids, sample_count)
+    if not selected_frames:
+        out_df = pd.DataFrame(columns=["dataset_id", "frame", "time_s", "distance_um", "row_component", "col_component", "component_pair", "part", "tensor_basis", "distance_mode", "velocity_source", "corr", "corr_sem", "n_pairs"])
+        out_df.to_parquet(out_path, index=False)
+        return out_df
+
+    px_xy = state["calibration"].get("px_per_micron")
+    px_z = state["calibration"].get("px_per_micron_z") or px_xy
+    if not px_xy:
+        raise ValueError("px_per_micron is required for spatial tensor time series")
+    px_xy = float(px_xy)
+    px_z = float(px_z) if px_z else float(px_xy)
+
+    max_radius_um = vector_cfg.get("tensor_max_radius_um", vector_cfg.get("spatial_max_radius_um"))
+    if max_radius_um is None:
+        max_radius_um = _tensor_default_max_radius(state, px_xy, px_z, distance_mode)
+    max_radius_um = float(max_radius_um)
+
+    nbins = int(vector_cfg.get("tensor_nbins", vector_cfg.get("spatial_nbins", 40)))
+    nbins = max(1, nbins)
+    bin_edges = np.linspace(0.0, max_radius_um, nbins + 1)
+    frame_seconds = _frame_seconds(state)
+
+    print(f"Computing spatial tensor time series from {len(selected_frames)} frames")
+    frame_profiles = []
+    for candidate_frame in selected_frames:
+        frame_df = df.loc[df["frame"] == candidate_frame].copy()
+        profile = _accumulate_spatial_tensor_profile_frame(
+            frame_df,
+            bin_edges,
+            max_radius_um,
+            state["dataset_id"],
+            velocity_source,
+            bool(vector_cfg.get("tensor_use_unit_vectors", vector_cfg.get("use_unit_vectors", True))),
+            distance_mode,
+            tensor_basis,
+        )
+        if profile is None or profile.empty:
+            continue
+        profile = profile.copy()
+        profile["time_s"] = float(candidate_frame) * float(frame_seconds)
+        frame_profiles.append(profile)
+
+    if not frame_profiles:
+        out_df = pd.DataFrame(columns=["dataset_id", "frame", "time_s", "distance_um", "row_component", "col_component", "component_pair", "part", "tensor_basis", "distance_mode", "velocity_source", "corr", "corr_sem", "n_pairs"])
+        out_df.to_parquet(out_path, index=False)
+        return out_df
+
+    out_df = pd.concat(frame_profiles, ignore_index=True)
+    out_df = out_df.sort_values(["frame", "part", "component_pair", "distance_um"], kind="mergesort").reset_index(drop=True)
+    out_df["distance_mode"] = distance_mode
+    out_df["velocity_source"] = velocity_source
+    out_df["tensor_basis"] = tensor_basis
+    out_df.to_parquet(out_path, index=False)
+    print(f"Saved spatial tensor time series correlation ({tensor_basis}) to {out_path}")
     return out_df
 
 
@@ -1135,6 +1410,10 @@ def run_vector_correlation_core(
             "spatial_df": pd.DataFrame(),
             "tensor_vector_corr_df": pd.DataFrame(),
             "tensor_df": pd.DataFrame(),
+            "tensor_spherical_vector_corr_df": pd.DataFrame(),
+            "tensor_spherical_df": pd.DataFrame(),
+            "tensor_time_series_df": pd.DataFrame(),
+            "tensor_spherical_time_series_df": pd.DataFrame(),
         }
 
     from .beads_velocity import compute_velocity_from_tracks
@@ -1170,25 +1449,60 @@ def run_vector_correlation_core(
         skip_existing=skip_existing,
         prepared_df=prepared_vel_df,
     )
-    tensor_df = (
-        compute_spatial_vector_tensor_correlation(
+    tensor_enabled = bool(vector_cfg.get("tensor_enabled", True))
+    tensor_basis_cfg = vector_cfg.get("tensor_bases")
+    if not tensor_enabled:
+        tensor_bases = []
+    elif isinstance(tensor_basis_cfg, (list, tuple)):
+        tensor_bases = [_tensor_basis_name(basis) for basis in tensor_basis_cfg if str(basis).strip()]
+    else:
+        tensor_bases = ["cartesian"]
+
+    tensor_outputs: dict[str, pd.DataFrame] = {}
+    tensor_time_series_outputs: dict[str, pd.DataFrame] = {}
+    for tensor_basis in tensor_bases:
+        tensor_outputs[tensor_basis] = compute_spatial_vector_tensor_correlation(
             state,
             vel_df,
             vector_cfg,
             skip_existing=skip_existing,
             prepared_df=prepared_vel_df,
+            tensor_basis=tensor_basis,
         )
-        if bool(vector_cfg.get("tensor_enabled", True))
-        else pd.DataFrame()
-    )
+        if bool(vector_cfg.get("tensor_time_series_enabled", False)):
+            tensor_time_series_outputs[tensor_basis] = compute_spatial_vector_tensor_time_series(
+                state,
+                vel_df,
+                vector_cfg,
+                skip_existing=skip_existing,
+                prepared_df=prepared_vel_df,
+                tensor_basis=tensor_basis,
+            )
+        else:
+            tensor_time_series_outputs[tensor_basis] = pd.DataFrame()
 
-    return {
+    tensor_df = tensor_outputs.get("cartesian", pd.DataFrame())
+    tensor_time_series_df = tensor_time_series_outputs.get("cartesian", pd.DataFrame())
+
+    result = {
         "temporal_vector_corr_df": temporal_df,
         "spatial_vector_corr_df": spatial_df,
         "spatial_df": spatial_df,
         "tensor_vector_corr_df": tensor_df,
         "tensor_df": tensor_df,
+        "tensor_time_series_df": tensor_time_series_df,
     }
+    if "spherical" in tensor_outputs:
+        result["tensor_spherical_vector_corr_df"] = tensor_outputs["spherical"]
+        result["tensor_spherical_df"] = tensor_outputs["spherical"]
+    else:
+        result["tensor_spherical_vector_corr_df"] = pd.DataFrame()
+        result["tensor_spherical_df"] = pd.DataFrame()
+    if "spherical" in tensor_time_series_outputs:
+        result["tensor_spherical_time_series_df"] = tensor_time_series_outputs["spherical"]
+    else:
+        result["tensor_spherical_time_series_df"] = pd.DataFrame()
+    return result
 
 
 def _merge_runtime(config: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:

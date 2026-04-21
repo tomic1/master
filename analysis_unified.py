@@ -48,6 +48,7 @@ from analysis_pipeline.comparison import (
 from analysis_pipeline.config import load_analysis_config, merge_overrides
 from analysis_pipeline.correlation_plots import (
     plot_spatial_vector_correlation,
+    _fit_temporal_decay_with_error,
     plot_temporal_vector_correlation,
     plot_vector_tensor_correlation,
     plot_vector_tensor_pair_decay,
@@ -65,12 +66,13 @@ DEFAULT_CONFIG_PATH = Path("config/analysis_default.yaml")
 FEATURE_ORDER = ("beads", "autocorr", "image_corr", "vector_corr", "summary")
 
 # Edit these values directly when you want to run the file like a notebook.
-NOTEBOOK_DATASET_ID = "AMF_105_002__C640_C470" #"AMF_113_002__C640_C470" #"AMF_108_002__C640_C470"
-NOTEBOOK_BASE_DIR = "/Volumes/dataserver_files/Group_Bausch/Tom_Dataserver/20260407"  # dataserver_files/Group_Bausch/Tom_Dataserver/20260407
+#NOTEBOOK_DATASET_ID =  "AMF_108_002__C640_C470"  # "AMF_105_002__C640_C470"
+NOTEBOOK_DATASET_ID = None
+NOTEBOOK_BASE_DIR = "/Volumes/X9"  # dataserver_files/Group_Bausch/Tom_Dataserver/20260407
 NOTEBOOK_VARIATION: str | None = None
 NOTEBOOK_FEATURE_COMMANDS = [
     "beads:compute=0,plot=0,overwrite=0",
-    "autocorr:compute=1,plot=1,overwrite=1",
+    "autocorr:compute=0,plot=0,overwrite=0",
     "image_corr:compute=0,plot=0,overwrite=0",
     "vector_corr:compute=0,plot=0,overwrite=0",
     "summary:compute=0,plot=0,overwrite=0",
@@ -82,7 +84,6 @@ NOTEBOOK_RUN_ORDER: list[str] | None = None
 NOTEBOOK_BATCH_DATASET_IDS: list[str] = []
 NOTEBOOK_BATCH_BASE_DIRS: list[str] = []
 NOTEBOOK_COMPARISON_NAME: str | None = None
-NOTEBOOK_RUN_COMPARISON: bool = False
 
 # Short human-readable descriptions for each feature used in the printed
 # summary. These make it explicit what each feature computes and plots.
@@ -713,6 +714,109 @@ def _tensor_fit_summary_rows(
     return pd.DataFrame(rows)
 
 
+def _tensor_plot_sample_suffix(tensor_df: pd.DataFrame) -> str | None:
+    if tensor_df.empty or "frame" not in tensor_df.columns:
+        return None
+
+    frame_values = sorted({int(frame) for frame in tensor_df["frame"].dropna().astype(int).tolist()})
+    frame_counts: list[int] = []
+    if "frame_count" in tensor_df.columns:
+        frame_counts = [int(value) for value in tensor_df["frame_count"].dropna().astype(int).tolist() if int(value) > 0]
+
+    if frame_counts:
+        frame_count = max(frame_counts)
+        if frame_count > 1:
+            return f"mean_n{frame_count}"
+
+    if len(frame_values) == 1 and frame_values[0] >= 0:
+        return f"frame_{frame_values[0]}"
+
+    if len(frame_values) == 1 and frame_values[0] < 0:
+        return "mean"
+
+    return None
+
+
+def _tensor_plot_stem(
+    dataset_id: str,
+    base_name: str,
+    vector_cfg: dict[str, Any],
+    tensor_df: pd.DataFrame,
+    *,
+    distance_mode: str | None = None,
+) -> str:
+    stem = f"{dataset_id}_{base_name}"
+    sample_suffix = _tensor_plot_sample_suffix(tensor_df)
+    if sample_suffix:
+        stem = f"{stem}_{sample_suffix}"
+    return build_velocity_artifact_stem(stem, vector_cfg, distance_mode=distance_mode)
+
+
+def _tensor_plot_sample_dir(tensor_dfs: Sequence[pd.DataFrame], base_dir: Path) -> Path:
+    for tensor_df in tensor_dfs:
+        sample_suffix = _tensor_plot_sample_suffix(tensor_df)
+        if sample_suffix:
+            return _ensure_dir(base_dir / sample_suffix)
+    return _ensure_dir(base_dir)
+
+
+def _tensor_component_pair_for_basis(component_pair: str, tensor_basis: str) -> str:
+    pair = str(component_pair).strip()
+    basis = str(tensor_basis).strip().lower()
+    if basis != "spherical":
+        return pair
+
+    spherical_map = {
+        "xx": "rr",
+        "xy": "rtheta",
+        "xz": "rphi",
+        "yx": "thetar",
+        "yy": "thetatheta",
+        "yz": "thetaphi",
+        "zx": "phir",
+        "zy": "phitheta",
+        "zz": "phiphi",
+    }
+    lower = pair.lower()
+    return spherical_map.get(lower, pair)
+
+
+def _tensor_fit_component_pairs_for_basis(component_pairs: Sequence[str], tensor_basis: str) -> list[str]:
+    translated: list[str] = []
+    seen: set[str] = set()
+    for component_pair in component_pairs:
+        basis_pair = _tensor_component_pair_for_basis(component_pair, tensor_basis)
+        if not basis_pair or basis_pair in seen:
+            continue
+        translated.append(basis_pair)
+        seen.add(basis_pair)
+    return translated
+
+
+def _tensor_comparison_output_keys(tensor_basis: str) -> tuple[str, str]:
+    basis = str(tensor_basis).strip().lower()
+    if basis == "spherical":
+        return "tensor_spherical_vector_corr_df", "tensor_spherical_time_series_df"
+    return "tensor_vector_corr_df", "tensor_time_series_df"
+
+
+def _tensor_comparison_component_specs(tensor_basis: str, tensor_fit_enabled: bool) -> list[tuple[str, str, bool, str]]:
+    basis = str(tensor_basis).strip().lower()
+    if basis == "spherical":
+        return [
+            ("symmetric", "rr", tensor_fit_enabled, r"Spherical tensor $rr$ correlation"),
+            ("symmetric", "thetatheta", tensor_fit_enabled, r"Spherical tensor $\theta\theta$ correlation"),
+            ("symmetric", "phiphi", tensor_fit_enabled, r"Spherical tensor $\phi\phi$ correlation"),
+            ("antisymmetric", "rtheta", False, r"Spherical tensor $r\,\theta$ correlation"),
+            ("antisymmetric", "rphi", False, r"Spherical tensor $r\,\phi$ correlation"),
+            ("antisymmetric", "thetaphi", False, r"Spherical tensor $\theta\,\phi$ correlation"),
+        ]
+    return [
+        ("symmetric", "xx", tensor_fit_enabled, r"Tensor $xx$ correlation"),
+        ("antisymmetric", "xy", False, r"Tensor $xy$ correlation"),
+    ]
+
+
 def _plot_tensor_fit_summary(
     ax: Axes,
     fit_rows: pd.DataFrame,
@@ -942,13 +1046,18 @@ def _comparison_dataset_pairs_from_config(
     return _normalize_batch_inputs(dataset_ids, base_dirs, default_base_dir=default_base_dir)
 
 
-def _prepare_velocity_time_series_for_comparison(vel_df: pd.DataFrame, fps: float | None) -> pd.DataFrame:
+def _prepare_velocity_time_series_for_comparison(
+    vel_df: pd.DataFrame,
+    fps: float | None,
+    *,
+    speed_columns: Sequence[str] = ("speed_um_s", "drift_speed_um_s", "speed_drift_corrected_um_s"),
+) -> pd.DataFrame:
     if vel_df is None or vel_df.empty or "frame" not in vel_df.columns:
         return pd.DataFrame()
 
     speed_cols = [
         col
-        for col in ("speed_um_s", "drift_speed_um_s", "speed_drift_corrected_um_s")
+        for col in speed_columns
         if col in vel_df.columns
     ]
     if not speed_cols:
@@ -963,6 +1072,10 @@ def _prepare_velocity_time_series_for_comparison(vel_df: pd.DataFrame, fps: floa
     else:
         grouped["time_s"] = grouped["frame"].astype(float) / fps_value
     return grouped
+
+
+def _prepare_drift_velocity_time_series_for_comparison(vel_df: pd.DataFrame, fps: float | None) -> pd.DataFrame:
+    return _prepare_velocity_time_series_for_comparison(vel_df, fps, speed_columns=("drift_speed_um_s",))
 
 
 def _collapse_series_for_comparison(
@@ -1145,6 +1258,67 @@ def _sampled_autocorr_length_time_series(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("time_s").reset_index(drop=True)
 
 
+def _tensor_decay_length_time_series(
+    df: pd.DataFrame,
+    *,
+    part: str,
+    component_pair: str,
+    fit_range: tuple[float | None, float | None] | None = None,
+    min_points: int = 4,
+) -> pd.DataFrame:
+    if df.empty or not {"frame", "distance_um", "corr", "part", "component_pair"}.issubset(df.columns):
+        return pd.DataFrame()
+
+    subset = df.loc[(df["part"].astype(str) == str(part)) & (df["component_pair"].astype(str) == str(component_pair))].copy()
+    if subset.empty:
+        return pd.DataFrame()
+
+    rows: list[dict[str, Any]] = []
+    for frame_value, frame_df in subset.groupby("frame", sort=True):
+        frame_df = frame_df.dropna(subset=["distance_um", "corr"]).copy()
+        if frame_df.empty:
+            continue
+
+        frame_index = int(frame_df["frame"].astype(int).iloc[0])
+
+        grouped = frame_df.groupby("distance_um", as_index=False).mean(numeric_only=True).sort_values("distance_um")
+        if grouped.empty or "distance_um" not in grouped.columns or "corr" not in grouped.columns:
+            continue
+
+        fit_popt, fit_xi, fit_xi_err = _fit_signed_decay(
+            grouped["distance_um"].to_numpy(dtype=float),
+            grouped["corr"].to_numpy(dtype=float),
+            yerr=grouped["corr_sem"].to_numpy(dtype=float) if "corr_sem" in grouped.columns else None,
+            fit_range=fit_range,
+            min_points=min_points,
+        )
+        if fit_popt is None or fit_xi is None:
+            continue
+
+        if "time_s" in frame_df.columns and frame_df["time_s"].dropna().size:
+            time_value = float(frame_df["time_s"].dropna().astype(float).iloc[0])
+        else:
+            time_value = float(frame_index)
+
+        rows.append(
+            {
+                "frame": frame_index,
+                "time_s": time_value,
+                "part": str(part),
+                "component_pair": str(component_pair),
+                "xi_um": float(fit_xi),
+                "xi_err_um": float(fit_xi_err) if fit_xi_err is not None and np.isfinite(fit_xi_err) else np.nan,
+                "amp": float(fit_popt[0]) if fit_popt is not None and len(fit_popt) > 0 else np.nan,
+                "offset": float(fit_popt[2]) if fit_popt is not None and len(fit_popt) > 2 else np.nan,
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows).sort_values("time_s").reset_index(drop=True)
+
+
 def _plot_autocorr_length_time_series(
     ax: Axes,
     table: pd.DataFrame,
@@ -1267,9 +1441,40 @@ def run_batch_comparison(
     saved: dict[str, dict[str, Path]] = {}
     sorted_records = sorted(records, key=lambda item: _comparison_sort_key(item[0]))
 
+    tensor_sample_suffix = None
+    for _, runner in sorted_records:
+        tensor_probe = _read_output_or_parquet(
+            runner,
+            "vector_corr",
+            "tensor_vector_corr_df",
+            _velocity_output_name(
+                "beads_vector_correlation_tensor_avg.parquet" if bool(reference_cfg.get("vector_corr", {}).get("multi_frame_average", False)) else "beads_vector_correlation_tensor.parquet",
+                reference_cfg.get("vector_corr", {}) if isinstance(reference_cfg.get("vector_corr", {}), dict) else {},
+                distance_mode=str((reference_cfg.get("vector_corr", {}) if isinstance(reference_cfg.get("vector_corr", {}), dict) else {}).get("tensor_distance_mode", "xyz")).strip().lower(),
+            ),
+        )
+        if tensor_probe.empty:
+            tensor_probe = _read_output_or_parquet(
+                runner,
+                "vector_corr",
+                "tensor_spherical_vector_corr_df",
+                _velocity_output_name(
+                    "beads_vector_correlation_tensor_avg.parquet" if bool(reference_cfg.get("vector_corr", {}).get("multi_frame_average", False)) else "beads_vector_correlation_tensor.parquet",
+                    reference_cfg.get("vector_corr", {}) if isinstance(reference_cfg.get("vector_corr", {}), dict) else {},
+                    distance_mode=str((reference_cfg.get("vector_corr", {}) if isinstance(reference_cfg.get("vector_corr", {}), dict) else {}).get("tensor_distance_mode", "xyz")).strip().lower(),
+                    tensor_basis="spherical",
+                ),
+            )
+        tensor_sample_suffix = _tensor_plot_sample_suffix(tensor_probe)
+        if tensor_sample_suffix:
+            break
+    if tensor_sample_suffix:
+        out_dir = _ensure_dir(out_dir / tensor_sample_suffix)
+
     # Velocity-over-time comparison (dataset-level curves).
     velocity_parts: list[pd.DataFrame] = []
     speed_summary_rows: list[dict[str, Any]] = []
+    drift_velocity_parts: list[pd.DataFrame] = []
     for dataset_order, (spec, runner) in enumerate(sorted_records):
         vel_df = _read_output_or_parquet(runner, "beads", "tracks_vel_df", "beads_tracks_with_velocity.parquet")
         fps = runner.load_state().get("calibration", {}).get("fps")
@@ -1302,6 +1507,19 @@ def run_batch_comparison(
             }
         )
 
+        drift_series = _prepare_drift_velocity_time_series_for_comparison(vel_df, fps=fps)
+        if drift_series.empty or "drift_speed_um_s" not in drift_series.columns:
+            continue
+        drift_values = drift_series["drift_speed_um_s"].to_numpy(dtype=float)
+        drift_mean_value = float(np.nanmean(drift_values))
+        drift_std_value = float(np.nanstd(drift_values, ddof=0))
+        drift_series = drift_series.rename(columns={"drift_speed_um_s": "corr", "drift_speed_um_s_std": "corr_std"})
+        drift_velocity_label = _format_math_uncertainty_label(r"v_{\mathrm{drift}}", drift_mean_value, drift_std_value, r"\mu\mathrm{m}/\mathrm{s}")
+        drift_series["dataset_order"] = int(dataset_order)
+        drift_series["dataset_color"] = spec.color
+        drift_series["legend_label"] = f"{spec.label} {drift_velocity_label}"
+        drift_velocity_parts.append(drift_series[["time_s", "corr", "corr_std", "dataset_order", "dataset_color", "legend_label"]])
+
     if velocity_parts:
         vel_cmp = pd.concat(velocity_parts, ignore_index=True)
         with comparison_style_context("dark"):
@@ -1325,6 +1543,32 @@ def run_batch_comparison(
 
             stem = f"{comparison_name}_beads_velocity_over_time"
             saved[stem] = save_comparison_dual_pdf(fig, out_dir, stem, white_plot_fn=_white_velocity)
+            plt.close(fig)
+
+    drift_velocity_enabled = bool(comparison_cfg.get("drift_velocity_over_time_enabled", False))
+    if drift_velocity_enabled and drift_velocity_parts:
+        drift_vel_cmp = pd.concat(drift_velocity_parts, ignore_index=True)
+        with comparison_style_context("dark"):
+            fig, ax = plt.subplots(figsize=(8.0, 4.8), dpi=150)
+            _grouped_line_plot(
+                ax,
+                drift_vel_cmp,
+                "time_s",
+                title="Drift speed comparison",
+                y_col="corr",
+                label_col="legend_label",
+                band_col="corr_std",
+            )
+            ax.set_ylabel(r"drift speed ($\mu\mathrm{m}/\mathrm{s}$)")
+            ax.set_xlabel("time (s)")
+
+            def _white_drift_velocity(ax_white: Axes, table=drift_vel_cmp) -> None:
+                _grouped_line_plot(ax_white, table, "time_s", title=None, y_col="corr", label_col="legend_label", band_col="corr_std")
+                ax_white.set_ylabel(r"drift speed ($\mu\mathrm{m}/\mathrm{s}$)")
+                ax_white.set_xlabel("time (s)")
+
+            stem = f"{comparison_name}_beads_drift_velocity_over_time"
+            saved[stem] = save_comparison_dual_pdf(fig, out_dir, stem, white_plot_fn=_white_drift_velocity)
             plt.close(fig)
 
     if speed_summary_rows:
@@ -1612,19 +1856,18 @@ def run_batch_comparison(
         grouped = (
             temporal_df.dropna(subset=["lag_s", "corr"])
             .groupby("lag_s", as_index=False)
-            .agg(corr=("corr", "mean"), corr_std=("corr", "std"), n_pairs=("corr", "size"))
+            .agg(
+                corr=("corr", "mean"),
+                corr_std=("corr", "std"),
+                n_pairs=("corr", "size"),
+            )
         )
         grouped["corr_std"] = grouped["corr_std"].fillna(0.0)
-        fit_popt, fit_tau, fit_tau_err = _fit_signed_decay(
-            grouped["lag_s"].to_numpy(dtype=float),
-            grouped["corr"].to_numpy(dtype=float),
-            yerr=grouped["corr_std"].to_numpy(dtype=float),
-            fit_range=temporal_range,
-            min_points=4,
-        )
-        if fit_popt is not None and fit_tau is not None:
-            grouped["tau_str_s"] = float(fit_tau)
-            grouped["tau_err_s"] = float(fit_tau_err) if fit_tau_err is not None and np.isfinite(fit_tau_err) else np.nan
+        fit_popt, fit_tau, fit_tau_err = _fit_temporal_decay_with_error(temporal_df, "lag_s", "corr", fit_range=temporal_range)
+        grouped["tau_str_s"] = float(fit_tau) if fit_tau is not None and np.isfinite(fit_tau) else np.nan
+        grouped["tau_err_s"] = float(fit_tau_err) if fit_tau_err is not None and np.isfinite(fit_tau_err) else np.nan
+        grouped["amp"] = float(fit_popt[0]) if fit_popt is not None and len(fit_popt) > 0 else np.nan
+        grouped["offset"] = float(fit_popt[2]) if fit_popt is not None and len(fit_popt) > 2 else np.nan
         grouped["dataset_order"] = int(dataset_order)
         grouped["dataset_color"] = spec.color
         grouped["legend_label"] = spec.label
@@ -1634,36 +1877,126 @@ def run_batch_comparison(
         temporal_cmp = pd.concat(temporal_parts, ignore_index=True)
         with comparison_style_context("dark"):
             fig, ax = plt.subplots(figsize=(8.0, 4.8), dpi=150)
-            _grouped_line_plot(
-                ax,
-                temporal_cmp,
-                "lag_s",
-                title="Temporal vector correlation comparison",
-                x_range=temporal_range,
-                label_col="legend_label",
-                band_col="corr_std",
-                fit_value_col="tau_str_s",
-                fit_error_col="tau_err_s",
-                fit_symbol=r"\tau",
-                fit_unit=r"\mathrm{s}",
-                fit_label_formatter=lambda label, value, error, symbol, unit: f"{label} {_format_math_uncertainty_label(symbol, value, error, unit)}",
-            )
+            x_series: list[np.ndarray] = []
+            y_series: list[np.ndarray] = []
+            for dataset_order, dataset_df in temporal_cmp.groupby("dataset_order", sort=True):
+                dataset_df = dataset_df.sort_values("lag_s")
+                if dataset_df.empty:
+                    continue
+                color = str(dataset_df["dataset_color"].iloc[0]) if "dataset_color" in dataset_df.columns else None
+                label = str(dataset_df["legend_label"].iloc[0]) if "legend_label" in dataset_df.columns else str(dataset_order)
+                x = dataset_df["lag_s"].to_numpy(dtype=float)
+                y = dataset_df["corr"].to_numpy(dtype=float)
+                yerr = dataset_df["corr_std"].to_numpy(dtype=float) if "corr_std" in dataset_df.columns else None
+                mask = np.isfinite(x) & np.isfinite(y)
+                if temporal_range is not None:
+                    lower, upper = temporal_range
+                    if lower is not None:
+                        mask &= x >= float(lower)
+                    if upper is not None:
+                        mask &= x <= float(upper)
+                x = x[mask]
+                y = y[mask]
+                if yerr is not None:
+                    yerr = yerr[mask]
+                if x.size == 0:
+                    continue
+                x_series.append(x)
+                y_series.append(y)
+
+                tau_values = dataset_df["tau_str_s"].to_numpy(dtype=float) if "tau_str_s" in dataset_df.columns else np.array([], dtype=float)
+                tau_values = tau_values[np.isfinite(tau_values)]
+                tau = float(np.nanmedian(tau_values)) if tau_values.size else np.nan
+                tau_err_values = dataset_df["tau_err_s"].to_numpy(dtype=float) if "tau_err_s" in dataset_df.columns else np.array([], dtype=float)
+                tau_err_values = tau_err_values[np.isfinite(tau_err_values)] if tau_err_values.size else np.array([], dtype=float)
+                tau_err = float(np.nanmedian(tau_err_values)) if tau_err_values.size else np.nan
+                amp_values = dataset_df["amp"].to_numpy(dtype=float) if "amp" in dataset_df.columns else np.array([], dtype=float)
+                amp_values = amp_values[np.isfinite(amp_values)] if amp_values.size else np.array([], dtype=float)
+                offset_values = dataset_df["offset"].to_numpy(dtype=float) if "offset" in dataset_df.columns else np.array([], dtype=float)
+                offset_values = offset_values[np.isfinite(offset_values)] if offset_values.size else np.array([], dtype=float)
+                if np.isfinite(tau) and tau > 0 and amp_values.size and offset_values.size:
+                    tau_label = _format_math_uncertainty_label(r"\tau", tau, tau_err, r"\mathrm{s}")
+                    label = f"{label} {tau_label}"
+                    x_fit = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 250)
+                    ax.plot(x_fit, _exp_decay(x_fit, float(np.nanmedian(amp_values)), tau, float(np.nanmedian(offset_values))), ls="--", lw=1.4, color=color, alpha=0.85, label="_nolegend_")
+
+                ax.plot(x, y, lw=2.0, color=color, label=label)
+                if yerr is not None and np.any(np.isfinite(yerr)):
+                    yerr = np.where(np.isfinite(yerr), yerr, 0.0)
+                    ax.fill_between(x, y - yerr, y + yerr, alpha=0.14, color=color, linewidth=0)
+
+            ax.set_title("Temporal vector correlation comparison")
+            ax.set_xlabel("lag (s)")
+            ax.set_ylabel("correlation")
+            ax.grid(True, alpha=0.25)
+            ax.legend(frameon=True)
+
+            x_limits = _finite_limits(x_series)
+            y_limits = _finite_limits(y_series)
+            if x_limits is not None:
+                ax.set_xlim(*x_limits)
+            if y_limits is not None:
+                ax.set_ylim(*y_limits)
 
             def _white_temporal(ax_white: Axes, table=temporal_cmp) -> None:
-                _grouped_line_plot(
-                    ax_white,
-                    table,
-                    "lag_s",
-                    title=None,
-                    x_range=temporal_range,
-                    label_col="legend_label",
-                    band_col="corr_std",
-                    fit_value_col="tau_str_s",
-                    fit_error_col="tau_err_s",
-                    fit_symbol=r"\tau",
-                    fit_unit=r"\mathrm{s}",
-                    fit_label_formatter=lambda label, value, error, symbol, unit: f"{label} {_format_math_uncertainty_label(symbol, value, error, unit)}",
-                )
+                x_series_white: list[np.ndarray] = []
+                y_series_white: list[np.ndarray] = []
+                for dataset_order, dataset_df in table.groupby("dataset_order", sort=True):
+                    dataset_df = dataset_df.sort_values("lag_s")
+                    if dataset_df.empty:
+                        continue
+                    color = str(dataset_df["dataset_color"].iloc[0]) if "dataset_color" in dataset_df.columns else None
+                    label = str(dataset_df["legend_label"].iloc[0]) if "legend_label" in dataset_df.columns else str(dataset_order)
+                    x = dataset_df["lag_s"].to_numpy(dtype=float)
+                    y = dataset_df["corr"].to_numpy(dtype=float)
+                    yerr = dataset_df["corr_std"].to_numpy(dtype=float) if "corr_std" in dataset_df.columns else None
+                    mask = np.isfinite(x) & np.isfinite(y)
+                    if temporal_range is not None:
+                        lower, upper = temporal_range
+                        if lower is not None:
+                            mask &= x >= float(lower)
+                        if upper is not None:
+                            mask &= x <= float(upper)
+                    x = x[mask]
+                    y = y[mask]
+                    if yerr is not None:
+                        yerr = yerr[mask]
+                    if x.size == 0:
+                        continue
+                    x_series_white.append(x)
+                    y_series_white.append(y)
+
+                    tau_values = dataset_df["tau_str_s"].to_numpy(dtype=float) if "tau_str_s" in dataset_df.columns else np.array([], dtype=float)
+                    tau_values = tau_values[np.isfinite(tau_values)]
+                    tau = float(np.nanmedian(tau_values)) if tau_values.size else np.nan
+                    tau_err_values = dataset_df["tau_err_s"].to_numpy(dtype=float) if "tau_err_s" in dataset_df.columns else np.array([], dtype=float)
+                    tau_err_values = tau_err_values[np.isfinite(tau_err_values)] if tau_err_values.size else np.array([], dtype=float)
+                    tau_err = float(np.nanmedian(tau_err_values)) if tau_err_values.size else np.nan
+                    amp_values = dataset_df["amp"].to_numpy(dtype=float) if "amp" in dataset_df.columns else np.array([], dtype=float)
+                    amp_values = amp_values[np.isfinite(amp_values)] if amp_values.size else np.array([], dtype=float)
+                    offset_values = dataset_df["offset"].to_numpy(dtype=float) if "offset" in dataset_df.columns else np.array([], dtype=float)
+                    offset_values = offset_values[np.isfinite(offset_values)] if offset_values.size else np.array([], dtype=float)
+                    if np.isfinite(tau) and tau > 0 and amp_values.size and offset_values.size:
+                        tau_label = _format_math_uncertainty_label(r"\tau", tau, tau_err, r"\mathrm{s}")
+                        label = f"{label} {tau_label}"
+                        x_fit = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 250)
+                        ax_white.plot(x_fit, _exp_decay(x_fit, float(np.nanmedian(amp_values)), tau, float(np.nanmedian(offset_values))), ls="--", lw=1.4, color=color, alpha=0.85, label="_nolegend_")
+
+                    ax_white.plot(x, y, lw=2.0, color=color, label=label)
+                    if yerr is not None and np.any(np.isfinite(yerr)):
+                        yerr = np.where(np.isfinite(yerr), yerr, 0.0)
+                        ax_white.fill_between(x, y - yerr, y + yerr, alpha=0.14, color=color, linewidth=0)
+
+                ax_white.set_xlabel("lag (s)")
+                ax_white.set_ylabel("correlation")
+                ax_white.grid(True, alpha=0.25)
+                ax_white.legend(frameon=True)
+                x_limits = _finite_limits(x_series_white)
+                y_limits = _finite_limits(y_series_white)
+                if x_limits is not None:
+                    ax_white.set_xlim(*x_limits)
+                if y_limits is not None:
+                    ax_white.set_ylim(*y_limits)
 
             stem = f"{comparison_name}_temporal_vector_correlation"
             saved[stem] = save_comparison_dual_pdf(fig, out_dir, stem, white_plot_fn=_white_temporal)
@@ -1671,6 +2004,7 @@ def run_batch_comparison(
 
     tensor_cfg = vector_cfg
     tensor_fit_enabled = bool(tensor_cfg.get("tensor_fit_enabled", False))
+    tensor_distance_mode = str(vector_cfg.get("tensor_distance_mode", "xyz")).strip().lower()
     tensor_fit_range = _range_from_config(
         tensor_cfg.get("tensor_fit_distance_um_min"),
         tensor_cfg.get("tensor_fit_distance_um_max"),
@@ -1680,6 +2014,7 @@ def run_batch_comparison(
     def _plot_tensor_component_pair(
         ax: Axes,
         *,
+        tensor_basis: str,
         part: str,
         component_pair: str,
         include_fit: bool,
@@ -1687,15 +2022,17 @@ def run_batch_comparison(
     ) -> None:
         x_series: list[np.ndarray] = []
         y_series: list[np.ndarray] = []
+        tensor_result_key, _ = _tensor_comparison_output_keys(tensor_basis)
         for dataset_order, (spec, runner) in enumerate(sorted_records):
             tensor_df = _read_output_or_parquet(
                 runner,
                 "vector_corr",
-                "tensor_vector_corr_df",
+                tensor_result_key,
                 _velocity_output_name(
                     "beads_vector_correlation_tensor_avg.parquet" if bool(vector_cfg.get("multi_frame_average", False)) else "beads_vector_correlation_tensor.parquet",
                     vector_cfg,
                     distance_mode=str(vector_cfg.get("tensor_distance_mode", "xyz")).strip().lower(),
+                    tensor_basis=tensor_basis,
                 ),
             )
             if tensor_df.empty:
@@ -1773,34 +2110,112 @@ def run_batch_comparison(
         if y_limits is not None:
             ax.set_ylim(*y_limits)
 
-    tensor_component_specs = (
-        ("symmetric", "xx", tensor_fit_enabled, "Tensor xx correlation"),
-        ("antisymmetric", "xy", False, "Tensor xy correlation"),
-    )
-
-    for part, component_pair, include_fit, title in tensor_component_specs:
-        with comparison_style_context("dark"):
-            fig, ax = plt.subplots(figsize=(8.4, 4.8), dpi=150)
-            _plot_tensor_component_pair(
-                ax,
-                part=part,
-                component_pair=component_pair,
-                include_fit=include_fit,
-                title=title,
-            )
-
-            def _white_tensor(ax_white: Axes, part_name=part, pair_name=component_pair, fit_enabled=include_fit) -> None:
+    for tensor_basis in ("cartesian", "spherical"):
+        for part, component_pair, include_fit, title in _tensor_comparison_component_specs(tensor_basis, tensor_fit_enabled):
+            with comparison_style_context("dark"):
+                fig, ax = plt.subplots(figsize=(8.4, 4.8), dpi=150)
                 _plot_tensor_component_pair(
-                    ax_white,
-                    part=part_name,
-                    component_pair=pair_name,
-                    include_fit=fit_enabled,
-                    title=None,
+                    ax,
+                    tensor_basis=tensor_basis,
+                    part=part,
+                    component_pair=component_pair,
+                    include_fit=include_fit,
+                    title=title,
                 )
 
-            stem = f"{comparison_name}_tensor_{component_pair}_correlation"
-            saved[stem] = save_comparison_dual_pdf(fig, out_dir, stem, white_plot_fn=_white_tensor)
-            plt.close(fig)
+                def _white_tensor(ax_white: Axes, part_name=part, pair_name=component_pair, fit_enabled=include_fit, basis_name=tensor_basis) -> None:
+                    _plot_tensor_component_pair(
+                        ax_white,
+                        tensor_basis=basis_name,
+                        part=part_name,
+                        component_pair=pair_name,
+                        include_fit=fit_enabled,
+                        title=None,
+                    )
+
+                stem = f"{comparison_name}_tensor_{part}_{component_pair}_correlation"
+                if tensor_basis == "spherical":
+                    stem = f"{comparison_name}_tensor_spherical_{part}_{component_pair}_correlation"
+                saved[stem] = save_comparison_dual_pdf(fig, out_dir, stem, white_plot_fn=_white_tensor)
+                plt.close(fig)
+
+    tensor_time_series_enabled = bool(vector_cfg.get("tensor_time_series_enabled", False))
+    if tensor_time_series_enabled:
+        tensor_time_series_specs = (
+            ("cartesian", "symmetric", "xx", "Tensor xx decay length over time"),
+            ("cartesian", "antisymmetric", "xy", "Tensor xy decay length over time"),
+            ("spherical", "symmetric", "rr", "Spherical tensor rr decay length over time"),
+            ("spherical", "antisymmetric", "rtheta", "Spherical tensor rtheta decay length over time"),
+        )
+        for tensor_basis, part, component_pair, title in tensor_time_series_specs:
+            _, tensor_time_series_key = _tensor_comparison_output_keys(tensor_basis)
+            time_parts: list[pd.DataFrame] = []
+            for dataset_order, (spec, runner) in enumerate(sorted_records):
+                tensor_time_df = _read_output_or_parquet(
+                    runner,
+                    "vector_corr",
+                    tensor_time_series_key,
+                    _velocity_output_name(
+                        "beads_vector_correlation_tensor_time_series.parquet",
+                        vector_cfg,
+                        distance_mode=tensor_distance_mode,
+                        tensor_basis=tensor_basis if tensor_basis == "spherical" else None,
+                    ),
+                )
+                if tensor_time_df.empty:
+                    continue
+
+                summary = _tensor_decay_length_time_series(
+                    tensor_time_df,
+                    part=part,
+                    component_pair=component_pair,
+                    fit_range=tensor_fit_range,
+                    min_points=tensor_fit_min_points,
+                )
+                if summary.empty:
+                    continue
+
+                summary = summary.copy()
+                summary["time_min"] = summary["time_s"].astype(float) / 60.0
+                summary["dataset_id"] = spec.dataset_id
+                summary["dataset_label"] = spec.label
+                summary["dataset_order"] = int(dataset_order)
+                summary["dataset_color"] = spec.color
+                summary["legend_label"] = spec.label
+                time_parts.append(summary)
+
+            if not time_parts:
+                continue
+
+            time_cmp = pd.concat(time_parts, ignore_index=True).sort_values(["dataset_order", "time_min"]).reset_index(drop=True)
+            with comparison_style_context("dark"):
+                fig, ax = plt.subplots(figsize=(8.0, 4.8), dpi=150)
+                _plot_autocorr_length_time_series(
+                    ax,
+                    time_cmp,
+                    title=f"{title} comparison",
+                    time_col="time_min",
+                    time_unit="min",
+                    use_log_x=False,
+                )
+                ax.set_ylabel(r"tensor decay length ($\mu\mathrm{m}$)")
+
+                def _white_tensor_time(ax_white: Axes, table=time_cmp, plot_title=title) -> None:
+                    _plot_autocorr_length_time_series(
+                        ax_white,
+                        table,
+                        title=None,
+                        time_col="time_min",
+                        time_unit="min",
+                        use_log_x=False,
+                    )
+                    ax_white.set_ylabel(r"tensor decay length ($\mu\mathrm{m}$)")
+
+                stem = f"{comparison_name}_tensor_{part}_{component_pair}_length_over_time"
+                if tensor_basis == "spherical":
+                    stem = f"{comparison_name}_tensor_spherical_{part}_{component_pair}_length_over_time"
+                saved[stem] = save_comparison_dual_pdf(fig, out_dir, stem, white_plot_fn=_white_tensor_time)
+                plt.close(fig)
 
     return saved
 
@@ -2349,10 +2764,30 @@ class AnalysisNotebookRunner:
                 vector_cfg,
                 distance_mode=tensor_distance_mode,
             )
+            tensor_spherical_name = _velocity_output_name(
+                "beads_vector_correlation_tensor_avg.parquet" if multi_frame_average else "beads_vector_correlation_tensor.parquet",
+                vector_cfg,
+                distance_mode=tensor_distance_mode,
+                tensor_basis="spherical",
+            )
+            tensor_time_series_name = _velocity_output_name(
+                "beads_vector_correlation_tensor_time_series.parquet",
+                vector_cfg,
+                distance_mode=tensor_distance_mode,
+            )
+            tensor_spherical_time_series_name = _velocity_output_name(
+                "beads_vector_correlation_tensor_time_series.parquet",
+                vector_cfg,
+                distance_mode=tensor_distance_mode,
+                tensor_basis="spherical",
+            )
             result = {
                 "temporal_vector_corr_df": _read_parquet(derived_dir / temporal_name),
                 "spatial_vector_corr_df": _read_parquet(derived_dir / spatial_name),
                 "tensor_vector_corr_df": _read_parquet(derived_dir / tensor_name),
+                "tensor_spherical_vector_corr_df": _read_parquet(derived_dir / tensor_spherical_name),
+                "tensor_time_series_df": _read_parquet(derived_dir / tensor_time_series_name),
+                "tensor_spherical_time_series_df": _read_parquet(derived_dir / tensor_spherical_time_series_name),
             }
 
         temporal_df = _result_frame(result, "temporal_vector_corr_df", "temporal_df")
@@ -2365,6 +2800,23 @@ class AnalysisNotebookRunner:
         if not tensor_df.empty and "part" in tensor_df.columns:
             part_counts = tensor_df["part"].astype(str).value_counts().to_dict()
             print(f"Tensor vector correlation loaded: {len(tensor_df)} rows across {part_counts}")
+        tensor_spherical_df = _result_frame(result, "tensor_spherical_vector_corr_df", "tensor_spherical_df")
+        if not tensor_spherical_df.empty and "part" in tensor_spherical_df.columns:
+            part_counts = tensor_spherical_df["part"].astype(str).value_counts().to_dict()
+            print(f"Spherical tensor vector correlation loaded: {len(tensor_spherical_df)} rows across {part_counts}")
+        tensor_time_series_df = _result_frame(result, "tensor_time_series_df")
+        if not tensor_time_series_df.empty and {"part", "component_pair"}.issubset(tensor_time_series_df.columns):
+            pair_counts = tensor_time_series_df.groupby(["part", "component_pair"]).size().to_dict()
+            print(f"Tensor time-series correlation loaded: {len(tensor_time_series_df)} rows across {pair_counts}")
+        tensor_spherical_time_series_df = _result_frame(result, "tensor_spherical_time_series_df")
+        if not tensor_spherical_time_series_df.empty and {"part", "component_pair"}.issubset(tensor_spherical_time_series_df.columns):
+            pair_counts = tensor_spherical_time_series_df.groupby(["part", "component_pair"]).size().to_dict()
+            print(f"Spherical tensor time-series correlation loaded: {len(tensor_spherical_time_series_df)} rows across {pair_counts}")
+
+        plot_dir = _tensor_plot_sample_dir(
+            [tensor_df, tensor_spherical_df, tensor_time_series_df, tensor_spherical_time_series_df],
+            plot_dir,
+        )
 
         if switch.plot:
             if not temporal_df.empty:
@@ -2434,27 +2886,33 @@ class AnalysisNotebookRunner:
                     print(f"Saved vector spatial correlation plots to {plot_dir}")
                     plt.close(fig)
 
-            if not tensor_df.empty:
-                tensor_plot_range = _range_from_config(
-                    vector_cfg.get("tensor_plot_distance_um_min"),
-                    vector_cfg.get("tensor_plot_distance_um_max"),
-                )
+            tensor_plot_range = _range_from_config(
+                vector_cfg.get("tensor_plot_distance_um_min"),
+                vector_cfg.get("tensor_plot_distance_um_max"),
+            )
+            tensor_basis_specs = [
+                ("cartesian", tensor_df, "Spatial vector tensor correlation", "vector_tensor_correlation"),
+                ("spherical", tensor_spherical_df, "Spherical vector tensor correlation", "vector_tensor_correlation_spherical"),
+            ]
+            for tensor_basis, basis_df, basis_title, stem_prefix in tensor_basis_specs:
+                if basis_df.empty:
+                    continue
                 for part, part_title, stem in (
-                    ("full", "Spatial vector tensor correlation", "vector_tensor_correlation_full"),
-                    ("symmetric", "Symmetric tensor correlation", "vector_tensor_correlation_symmetric"),
-                    ("antisymmetric", "Antisymmetric tensor correlation", "vector_tensor_correlation_antisymmetric"),
+                    ("full", basis_title, f"{stem_prefix}_full"),
+                    ("symmetric", ("Symmetric tensor correlation" if tensor_basis == "cartesian" else "Spherical symmetric tensor correlation"), f"{stem_prefix}_symmetric"),
+                    ("antisymmetric", ("Antisymmetric tensor correlation" if tensor_basis == "cartesian" else "Spherical antisymmetric tensor correlation"), f"{stem_prefix}_antisymmetric"),
                 ):
                     with comparison_style_context("dark"):
                         fig, ax = plt.subplots(figsize=(8.2, 4.8), dpi=150)
                         plot_vector_tensor_correlation(
                             ax,
-                            tensor_df,
+                            basis_df,
                             part=part,
                             title=part_title,
                             x_range=tensor_plot_range,
                         )
 
-                        def _white_tensor(ax_white: Axes, df=tensor_df, tensor_part=part) -> None:
+                        def _white_tensor(ax_white: Axes, df=basis_df, tensor_part=part) -> None:
                             plot_vector_tensor_correlation(
                                 ax_white,
                                 df,
@@ -2463,16 +2921,22 @@ class AnalysisNotebookRunner:
                                 x_range=tensor_plot_range,
                             )
 
-                        tensor_stem = build_velocity_artifact_stem(f"{dataset_id}_{stem}", vector_cfg, distance_mode=tensor_distance_mode)
+                        tensor_stem = _tensor_plot_stem(dataset_id, stem, vector_cfg, basis_df, distance_mode=tensor_distance_mode)
                         save_vector_correlation_dual_pdf(fig, plot_dir, tensor_stem, white_plot_fn=_white_tensor)
-                        print(f"Saved tensor vector correlation plots to {plot_dir} ({part})")
+                        print(f"Saved tensor vector correlation plots to {plot_dir} ({tensor_basis}, {part})")
                         plt.close(fig)
 
                 if bool(vector_cfg.get("tensor_fit_enabled", False)):
-                    tensor_fit_pairs = [str(pair).strip() for pair in vector_cfg.get("tensor_fit_component_pairs", []) if str(pair).strip()]
+                    tensor_fit_pairs = _tensor_fit_component_pairs_for_basis(
+                        [str(pair).strip() for pair in vector_cfg.get("tensor_fit_component_pairs", []) if str(pair).strip()],
+                        tensor_basis,
+                    )
                     tensor_fit_pairs_by_part_cfg = vector_cfg.get("tensor_fit_component_pairs_by_part", {})
                     tensor_fit_pairs_by_part = {
-                        str(part).strip(): [str(pair).strip() for pair in pairs if str(pair).strip()]
+                        str(part).strip(): _tensor_fit_component_pairs_for_basis(
+                            [str(pair).strip() for pair in pairs if str(pair).strip()],
+                            tensor_basis,
+                        )
                         for part, pairs in tensor_fit_pairs_by_part_cfg.items()
                         if str(part).strip() and isinstance(pairs, (list, tuple))
                     } if isinstance(tensor_fit_pairs_by_part_cfg, dict) else {}
@@ -2483,7 +2947,7 @@ class AnalysisNotebookRunner:
                     )
                     tensor_fit_min_points = int(vector_cfg.get("tensor_fit_min_points", 4))
                     available_pairs_by_part = {
-                        part_name: set(tensor_df.loc[tensor_df["part"].astype(str) == part_name, "component_pair"].astype(str))
+                        part_name: set(basis_df.loc[basis_df["part"].astype(str) == part_name, "component_pair"].astype(str))
                         for part_name in tensor_fit_parts
                     }
                     if tensor_fit_pairs or tensor_fit_pairs_by_part:
@@ -2496,16 +2960,17 @@ class AnalysisNotebookRunner:
                                 fig, ax = plt.subplots(figsize=(7.8, 4.8), dpi=150)
                                 plot_vector_tensor_pair_decay(
                                     ax,
-                                    tensor_df,
+                                    basis_df,
                                     part=part,
                                     component_pairs=part_pairs,
-                                    title=f"Tensor component-pair decay fits ({part})",
+                                    title=f"Tensor component-pair decay fits ({part})" if part != "antisymmetric" else f"Tensor component-pair decay ({part})",
                                     x_range=tensor_plot_range,
                                     fit_range=tensor_fit_range,
                                     min_points=tensor_fit_min_points,
+                                    fit_enabled=part != "antisymmetric",
                                 )
 
-                                def _white_tensor_fit(ax_white: Axes, df=tensor_df, tensor_part=part, pairs=part_pairs) -> None:
+                                def _white_tensor_fit(ax_white: Axes, df=basis_df, tensor_part=part, pairs=part_pairs) -> None:
                                     plot_vector_tensor_pair_decay(
                                         ax_white,
                                         df,
@@ -2515,10 +2980,16 @@ class AnalysisNotebookRunner:
                                         x_range=tensor_plot_range,
                                         fit_range=tensor_fit_range,
                                         min_points=tensor_fit_min_points,
+                                        fit_enabled=tensor_part != "antisymmetric",
                                     )
 
                                 pair_tag = "-".join(part_pairs)
-                                fit_stem = build_velocity_artifact_stem(f"{dataset_id}_tensor_component_pair_fits_{part}_{pair_tag}", vector_cfg)
+                                fit_stem = _tensor_plot_stem(
+                                    dataset_id,
+                                    f"tensor_component_pair_fits_{part}_{pair_tag}",
+                                    vector_cfg,
+                                    basis_df,
+                                )
                                 save_vector_correlation_dual_pdf(fig, plot_dir, fit_stem, white_plot_fn=_white_tensor_fit)
                                 print(f"Saved tensor pair-fit plots to {plot_dir} ({part})")
                                 plt.close(fig)
@@ -2682,6 +3153,10 @@ def main(argv: list[str] | None = None) -> Any:
     parser.add_argument("--notebook-base-dir", type=Path, default=None)
     args = parser.parse_args(argv)
 
+    config = load_analysis_config(str(args.config))
+    comparison_cfg = config.get("comparison", {}) if isinstance(config.get("comparison", {}), dict) else {}
+    comparison_cfg = resolve_comparison_preset(comparison_cfg)
+
     feature_commands = [*NOTEBOOK_FEATURE_COMMANDS, *args.notebook_feature_commands, *args.feature]
     enable = [*NOTEBOOK_ENABLE, *args.notebook_enable, *args.enable]
     disable = [*NOTEBOOK_DISABLE, *args.notebook_disable, *args.disable]
@@ -2690,7 +3165,8 @@ def main(argv: list[str] | None = None) -> Any:
     notebook_dataset_id = args.dataset_id if args.dataset_id is not None else args.notebook_dataset_id if args.notebook_dataset_id is not None else NOTEBOOK_DATASET_ID
     notebook_dataset_id = None if notebook_dataset_id is None else str(notebook_dataset_id).strip() or None
     notebook_variation = args.variation if args.variation is not None else args.notebook_variation if args.notebook_variation is not None else NOTEBOOK_VARIATION
-    comparison_enabled = NOTEBOOK_RUN_COMPARISON and not args.no_comparison
+    comparison_enabled = bool(comparison_cfg.get("enabled", False)) and not args.no_comparison
+    apply_notebook_feature_commands_to_single_datasets = bool(comparison_cfg.get("apply_notebook_feature_commands_to_single_datasets", True))
 
     dataset_ids = [str(value).strip() for value in args.dataset_ids if str(value).strip()]
     if not dataset_ids:
@@ -2701,17 +3177,13 @@ def main(argv: list[str] | None = None) -> Any:
         base_dirs = [str(value).strip() for value in NOTEBOOK_BATCH_BASE_DIRS if str(value).strip()]
 
     if dataset_ids or (comparison_enabled and not notebook_dataset_id):
-        cfg_for_comparison = load_analysis_config(str(args.config))
-        comparison_cfg = cfg_for_comparison.get("comparison", {}) if isinstance(cfg_for_comparison.get("comparison", {}), dict) else {}
-        comparison_cfg = resolve_comparison_preset(comparison_cfg)
-        apply_feature_commands_to_single_datasets = bool(comparison_cfg.get("apply_notebook_feature_commands_to_single_datasets", True))
         comparison_name = args.comparison_name or NOTEBOOK_COMPARISON_NAME or str(comparison_cfg.get("name", "batch_comparison"))
         comparison_output_root = str(comparison_cfg.get("output_root", "plots/comparisons"))
         variation = notebook_variation
 
         if not dataset_ids:
-            default_base_dir = str(cfg_for_comparison.get("dataset", {}).get("base_dir", "data"))
-            batch_pairs = _comparison_dataset_pairs_from_config(cfg_for_comparison, default_base_dir=default_base_dir)
+            default_base_dir = str(config.get("dataset", {}).get("base_dir", "data"))
+            batch_pairs = _comparison_dataset_pairs_from_config(config, default_base_dir=default_base_dir)
             dataset_ids = [dataset_id for dataset_id, _ in batch_pairs]
             base_dirs = [base_dir for _, base_dir in batch_pairs]
             if not dataset_ids:
@@ -2729,7 +3201,7 @@ def main(argv: list[str] | None = None) -> Any:
             enable=enable,
             disable=disable,
             overwrite=overwrite,
-            apply_feature_commands_to_single_datasets=apply_feature_commands_to_single_datasets,
+            apply_feature_commands_to_single_datasets=apply_notebook_feature_commands_to_single_datasets,
             run_comparison=comparison_enabled,
             comparison_name=comparison_name,
             comparison_output_root=comparison_output_root,
@@ -2737,12 +3209,15 @@ def main(argv: list[str] | None = None) -> Any:
         return batch_result
 
     runner = load_default_runner(config_path=args.config)
+    single_dataset_feature_commands = feature_commands if apply_notebook_feature_commands_to_single_datasets else []
+    if not apply_notebook_feature_commands_to_single_datasets and feature_commands:
+        print("Skipping NOTEBOOK feature command application on single-dataset run (comparison config override).")
     _apply_notebook_commands(
         runner,
         dataset_id=notebook_dataset_id,
         variation=notebook_variation,
         base_dir=args.base_dir if args.base_dir is not None else args.notebook_base_dir if args.notebook_base_dir is not None else NOTEBOOK_BASE_DIR,
-        feature_commands=feature_commands,
+        feature_commands=single_dataset_feature_commands,
         enable=enable,
         disable=disable,
         overwrite=overwrite,

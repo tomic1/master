@@ -10,12 +10,7 @@ import numpy as np
 from matplotlib.colors import LinearSegmentedColormap, to_hex
 
 
-ATP_COMPARISON_COLORS = (
-    "#08306b",
-    "#08519c",
-    "#2171b5",
-    "#6baed6",
-)
+ATP_COMPARISON_COLORS = tuple(to_hex(cm.get_cmap("winter")(value)) for value in np.linspace(0.15, 0.85, 4))
 
 PRC_COMPARISON_COLORS = (
     "#fff7bc",
@@ -50,7 +45,13 @@ def _resample_palette(anchors: Sequence[str], n: int) -> list[str]:
 def comparison_palette(kind: str, n: int) -> list[str]:
     kind_norm = str(kind).strip().lower()
     if kind_norm in {"atp", "blue", "b"}:
-        return _resample_palette(ATP_COMPARISON_COLORS, n)
+        cmap = cm.get_cmap("winter")
+        if n <= 0:
+            return []
+        if n == 1:
+            return [to_hex(cmap(0.5))]
+        samples = np.linspace(0.15, 0.85, n)
+        return [to_hex(cmap(value)) for value in samples]
     if kind_norm in {"prc", "green", "g"}:
         cmap = cm.get_cmap("YlOrRd")
         if n <= 0:

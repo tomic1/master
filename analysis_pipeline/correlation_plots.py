@@ -12,7 +12,7 @@ from .comparison import comparison_style_context, save_comparison_dual_pdf
 
 
 def _component_order(component: str) -> int:
-    order = {"vector": 0, "x": 1, "y": 2, "z": 3}
+    order = {"vector": 0, "x": 1, "y": 2, "z": 3, "r": 1, "theta": 2, "phi": 3}
     return order.get(str(component).lower(), 99)
 
 
@@ -316,6 +316,7 @@ def _plot_scatter(
     xi_err = None
     if fit:
         popt, xi, xi_err = _fit_temporal_decay_with_error(df, x_col, y_col, fit_range=fit_range)
+
         if popt is not None and xi is not None:
             x_min = float(np.nanmin(x))
             x_max = float(np.nanmax(x))
@@ -441,8 +442,68 @@ def plot_spatial_vector_correlation(
     ax.grid(True, alpha=0.25)
 
 
-_TENSOR_COMPONENTS = ("x", "y", "z")
-_TENSOR_PAIR_ORDER = [f"{row}{col}" for row in _TENSOR_COMPONENTS for col in _TENSOR_COMPONENTS]
+def _tensor_component_sequence(df: pd.DataFrame) -> list[str]:
+    if df.empty:
+        return []
+    row_components = df.get("row_component", pd.Series(dtype=object)).dropna().astype(str).tolist()
+    col_components = df.get("col_component", pd.Series(dtype=object)).dropna().astype(str).tolist()
+    components = sorted(set(row_components + col_components), key=_component_order)
+    return components
+
+
+def _tensor_pair_order(df: pd.DataFrame) -> list[str]:
+    components = _tensor_component_sequence(df)
+    return [f"{row}{col}" for row in components for col in components]
+
+
+def _tensor_basis_from_df(df: pd.DataFrame) -> str:
+    if "tensor_basis" not in df.columns:
+        return "cartesian"
+    basis_values = df["tensor_basis"].dropna().astype(str).str.strip().str.lower().tolist()
+    if not basis_values:
+        return "cartesian"
+    if "spherical" in basis_values:
+        return "spherical"
+    return basis_values[0]
+
+
+def _tensor_component_symbol(component: str, tensor_basis: str | None) -> str:
+    basis = str(tensor_basis or "cartesian").strip().lower()
+    component = str(component).strip()
+    if basis != "spherical":
+        return component
+    return {
+        "r": "r",
+        "theta": r"\theta",
+        "phi": r"\phi",
+    }.get(component.lower(), component)
+
+
+def _tensor_component_display(component: str, tensor_basis: str | None) -> str:
+    basis = str(tensor_basis or "cartesian").strip().lower()
+    if basis != "spherical":
+        return str(component)
+    return rf"${_tensor_component_symbol(component, basis)}$"
+
+
+def _tensor_component_pair_display(row_component: str, col_component: str, tensor_basis: str | None) -> str:
+    basis = str(tensor_basis or "cartesian").strip().lower()
+    if basis != "spherical":
+        return f"{row_component}{col_component}"
+    return rf"${_tensor_component_symbol(row_component, basis)}\,{_tensor_component_symbol(col_component, basis)}$"
+
+
+def _tensor_component_pair_display_map(df: pd.DataFrame) -> dict[str, str]:
+    if not {"row_component", "col_component"}.issubset(df.columns):
+        return {}
+
+    basis = _tensor_basis_from_df(df)
+    display_map: dict[str, str] = {}
+    for row_component in _tensor_component_sequence(df):
+        for col_component in _tensor_component_sequence(df):
+            pair_name = f"{row_component}{col_component}"
+            display_map[pair_name] = _tensor_component_pair_display(row_component, col_component, basis)
+    return display_map
 
 
 def plot_vector_tensor_correlation(
@@ -485,8 +546,11 @@ def plot_vector_tensor_correlation(
         else:
             raise ValueError("tensor dataframe must contain component_pair or row_component/col_component")
 
+    pair_display_map = _tensor_component_pair_display_map(sub)
+
     pivot = sub.pivot_table(index="component_pair", columns="distance_um", values="corr", aggfunc="mean")
-    pivot = pivot.reindex(_TENSOR_PAIR_ORDER)
+    tensor_pair_order = _tensor_pair_order(sub)
+    pivot = pivot.reindex(tensor_pair_order)
     if pivot.empty:
         ax.set_title(title or "")
         ax.text(0.5, 0.5, "no tensor grid", ha="center", va="center", transform=ax.transAxes)
@@ -518,10 +582,10 @@ def plot_vector_tensor_correlation(
         cmap="coolwarm",
         vmin=-limit,
         vmax=limit,
-        extent=[float(np.nanmin(dist_vals)), float(np.nanmax(dist_vals)), -0.5, len(_TENSOR_PAIR_ORDER) - 0.5],
+        extent=[float(np.nanmin(dist_vals)), float(np.nanmax(dist_vals)), -0.5, len(tensor_pair_order) - 0.5],
     )
-    ax.set_yticks(np.arange(len(_TENSOR_PAIR_ORDER)))
-    ax.set_yticklabels(_TENSOR_PAIR_ORDER)
+    ax.set_yticks(np.arange(len(tensor_pair_order)))
+    ax.set_yticklabels([pair_display_map.get(pair, pair) for pair in tensor_pair_order])
     tick_count = min(6, len(dist_vals))
     tick_positions = np.linspace(float(np.nanmin(dist_vals)), float(np.nanmax(dist_vals)), tick_count)
     ax.set_xticks(tick_positions)
@@ -542,6 +606,7 @@ def plot_vector_tensor_pair_decay(
     x_range: tuple[float | None, float | None] | None = None,
     fit_range: tuple[float | None, float | None] | None = None,
     min_points: int = 4,
+    fit_enabled: bool = True,
 ) -> None:
     if df.empty:
         ax.set_title(title or "")
@@ -562,12 +627,14 @@ def plot_vector_tensor_pair_decay(
         else:
             raise ValueError("tensor dataframe must contain component_pair or row_component/col_component")
 
+    pair_display_map = _tensor_component_pair_display_map(sub)
+
     if component_pairs:
         requested_pairs = [str(pair).strip() for pair in component_pairs if str(pair).strip()]
         sub = sub.loc[sub["component_pair"].astype(str).isin(requested_pairs)]
         pair_order = requested_pairs
     else:
-        pair_order = [pair for pair in _TENSOR_PAIR_ORDER if pair in set(sub["component_pair"].astype(str))]
+        pair_order = [pair for pair in _tensor_pair_order(sub) if pair in set(sub["component_pair"].astype(str))]
 
     if sub.empty or not pair_order:
         ax.set_title(title or "")
@@ -612,32 +679,34 @@ def plot_vector_tensor_pair_decay(
         x_series.append(x)
         y_series.append(y)
 
-        data_label = pair
+        display_pair = pair_display_map.get(pair, pair)
+        data_label = display_pair
         symbol, unit = r"\xi", r"\mu\mathrm{m}"
         if yerr is not None and np.any(np.isfinite(yerr)):
             ax.fill_between(x, y - yerr, y + yerr, alpha=0.12, color=color)
 
-        popt, xi, xi_err = _fit_signed_decay(x, y, yerr=yerr, fit_range=fit_range or x_range, min_points=min_points)
-        if popt is not None and xi is not None:
-            x_min = float(np.nanmin(x))
-            x_max = float(np.nanmax(x))
-            if fit_range is not None:
-                lower, upper = fit_range
-                if lower is not None:
-                    x_min = max(x_min, float(lower))
-                if upper is not None:
-                    x_max = min(x_max, float(upper))
-            elif x_range is not None:
-                lower, upper = x_range
-                if lower is not None:
-                    x_min = max(x_min, float(lower))
-                if upper is not None:
-                    x_max = min(x_max, float(upper))
-            if x_max > x_min:
-                x_fit = np.linspace(x_min, x_max, 250)
-                y_fit = _exp_decay(x_fit, *popt)
-                data_label = f"{pair} ({_format_decay_annotation(symbol, xi, xi_err, unit)})"
-                ax.plot(x_fit, y_fit, ls="--", lw=1.5, color=color, alpha=0.85, label="_nolegend_")
+        if fit_enabled:
+            popt, xi, xi_err = _fit_signed_decay(x, y, yerr=yerr, fit_range=fit_range or x_range, min_points=min_points)
+            if popt is not None and xi is not None:
+                x_min = float(np.nanmin(x))
+                x_max = float(np.nanmax(x))
+                if fit_range is not None:
+                    lower, upper = fit_range
+                    if lower is not None:
+                        x_min = max(x_min, float(lower))
+                    if upper is not None:
+                        x_max = min(x_max, float(upper))
+                elif x_range is not None:
+                    lower, upper = x_range
+                    if lower is not None:
+                        x_min = max(x_min, float(lower))
+                    if upper is not None:
+                        x_max = min(x_max, float(upper))
+                if x_max > x_min:
+                    x_fit = np.linspace(x_min, x_max, 250)
+                    y_fit = _exp_decay(x_fit, *popt)
+                    data_label = f"{display_pair} ({_format_decay_annotation(symbol, xi, xi_err, unit)})"
+                    ax.plot(x_fit, y_fit, ls="--", lw=1.5, color=color, alpha=0.85, label="_nolegend_")
 
         ax.plot(x, y, lw=1.8, color=color, label=data_label)
 

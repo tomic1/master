@@ -36,7 +36,7 @@ beads:
 autocorr:
   enabled: true
   single_frame_3d_enabled: true
-  sampled_3d_enabled: true
+  sampled_3d_enabled: false
   sampled_2d_enabled: false
   radial_2d_enabled: false
   channel_3d: 0
@@ -67,12 +67,12 @@ vector_corr:
   velocity_outlier_min_neighbors: 4
   velocity_outlier_threshold: 2.0
   multi_frame_average: true
-  multi_frame_count: 10
+  multi_frame_count: 20
   temporal_max_lag_frames: 100
   temporal_plot_max_points: 1000
   temporal_plot_lag_s_min: null
   temporal_plot_lag_s_max: null
-  temporal_fit_lag_s_min: null
+  temporal_fit_lag_s_min: 100
   temporal_fit_lag_s_max: null
   spatial_nbins: 200
   spatial_frame_index: 90
@@ -80,6 +80,9 @@ vector_corr:
   spatial_plot_distance_um_min: null
   spatial_plot_distance_um_max: null
   tensor_enabled: true
+  tensor_bases:
+    - cartesian
+    - spherical
   tensor_frame_index: 90
   tensor_use_unit_vectors: true
   tensor_distance_mode: xy
@@ -97,6 +100,8 @@ vector_corr:
   tensor_fit_distance_um_min: 5
   tensor_fit_distance_um_max: 200
   tensor_fit_min_points: 4
+  tensor_time_series_enabled: true
+  tensor_time_series_sample_count: 5
   parallel_workers: 0
 
 image_corr:
@@ -113,12 +118,13 @@ runtime:
   verbose: true
 
 comparison:
-  enabled: false
-  selected: atp
+  enabled: true
+  selected: prc
   output_root: plots/comparisons
   autocorr_sample_mode: mean  # mean | frame
   autocorr_sample_frame: 0
   apply_notebook_feature_commands_to_single_datasets: false
+  drift_velocity_over_time_enabled: true
 
   presets:
     prc:
@@ -195,6 +201,47 @@ comparison:
           label: 2000 µM
           group: ATP
           replicate: r5
+          raw_base_dir: /Volumes/Tom_Data
+          base_dir: data
+    prc_ls:
+      name: prc_104_109_ls_comparison
+      palette: prc_ls
+      output_root: plots/comparisons
+      registry: &prc_ls_registry
+        - dataset_id: AMF_105_003__C640_C470
+          label: 0 nM
+          group: PRC
+          replicate: r1
+          raw_base_dir: /Volumes/Tom_Data
+          base_dir: data
+        - dataset_id: AMF_106_004__C640_C470
+          label: 10 nM
+          group: PRC
+          replicate: r2
+          raw_base_dir: /Volumes/Tom_Data
+          base_dir: data
+        - dataset_id: AMF_107_004__C640_C470
+          label: 60 nM
+          group: PRC
+          replicate: r3
+          raw_base_dir: /Volumes/Tom_Data
+          base_dir: data
+        - dataset_id: AMF_108_004__C640_C470
+          label: 100 nM
+          group: PRC
+          replicate: r4
+          raw_base_dir: /Volumes/X9
+          base_dir: data
+        - dataset_id: AMF_109_005__C640_C470
+          label: 150 nM
+          group: PRC
+          replicate: r5
+          raw_base_dir: /Volumes/X9
+          base_dir: data
+        - dataset_id: AMF_104_004__C640_C470
+          label: 300 nM
+          group: PRC
+          replicate: r6
           raw_base_dir: /Volumes/Tom_Data
           base_dir: data
 

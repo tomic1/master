@@ -1,5 +1,5 @@
 # zarr embedding command example:
-python embed_existing_zarr.py /Volumes/dataserver_files/Group_Bausch/Tom_Dataserver/20260311/20260311_AMF_095_002.zarr --source-path /Volumes/dataserver_files/Group_Bausch/Tom_Dataserver/20260311/AMF_095_002.vsi --output-root "/Volumes/dataserver_files/Group_Bausch/Tom_Dataserver/20260311"  --overwrite --embed-data
+python /Users/tom/Uni_local/master_local/analysis/embed_existing_zarr.py /Volumes/Tom_Data/AMF_104_004.zarr --source-path /Volumes/workingspace/Tom/20260407/AMF_104_004.vsi --output-root "/Volumes/Tom_Data"  --overwrite --embed-data
 
 # 7zip mac command example:
 compressing:
