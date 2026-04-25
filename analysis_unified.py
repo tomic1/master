@@ -47,6 +47,8 @@ from analysis_pipeline.comparison import (
 )
 from analysis_pipeline.config import load_analysis_config, merge_overrides
 from analysis_pipeline.correlation_plots import (
+    _exp_decay,
+    _fit_signed_decay,
     plot_spatial_vector_correlation,
     _fit_temporal_decay_with_error,
     plot_temporal_vector_correlation,
@@ -55,15 +57,29 @@ from analysis_pipeline.correlation_plots import (
     save_vector_correlation_dual_pdf,
 )
 from analysis_pipeline.image_correlation import compute_raw_time_image_correlation, fit_time_image_correlation
-from analysis_pipeline.io_dataset import load_dataset_state
+from analysis_pipeline.io_dataset import load_dataset_state, prepare_output_dirs
 from analysis_pipeline.pipeline import run_autocorr_core, run_vector_correlation_core
+from analysis_pipeline.velocity_spectrum import (
+    _fit_power_law_curve as _velocity_spectrum_fit_power_law_curve,
+    _log_axis_limits as _velocity_spectrum_log_axis_limits,
+    plot_xy_vorticity_overlay,
+    plot_vorticity_spectrum,
+    plot_velocity_spectrum,
+    run_velocity_spectrum_core,
+    velocity_spectrum_artifact_stem,
+    velocity_vorticity_artifact_stem,
+    velocity_spectrum_output_name,
+    velocity_vorticity_output_name,
+    velocity_vorticity_spectrum_artifact_stem,
+    velocity_vorticity_spectrum_output_name,
+)
 from analysis_pipeline.velocity_movies import build_velocity_artifact_name, build_velocity_artifact_stem, render_bead_displacement_overlay_movie
 from analysis_pipeline.velocity_plots import save_velocity_over_time_dual_pdf
 from analysis_pipeline.vector_correlation import _velocity_output_name
 
 
 DEFAULT_CONFIG_PATH = Path("config/analysis_default.yaml")
-FEATURE_ORDER = ("beads", "autocorr", "image_corr", "vector_corr", "summary")
+FEATURE_ORDER = ("beads", "autocorr", "image_corr", "vector_corr", "velocity_spectrum", "summary")
 
 # Edit these values directly when you want to run the file like a notebook.
 #NOTEBOOK_DATASET_ID =  "AMF_108_002__C640_C470"  # "AMF_105_002__C640_C470"
@@ -75,6 +91,7 @@ NOTEBOOK_FEATURE_COMMANDS = [
     "autocorr:compute=0,plot=0,overwrite=0",
     "image_corr:compute=0,plot=0,overwrite=0",
     "vector_corr:compute=0,plot=0,overwrite=0",
+    "velocity_spectrum:compute=1,plot=1",
     "summary:compute=0,plot=0,overwrite=0",
 ]
 NOTEBOOK_ENABLE: list[str] = []
@@ -85,13 +102,12 @@ NOTEBOOK_BATCH_DATASET_IDS: list[str] = []
 NOTEBOOK_BATCH_BASE_DIRS: list[str] = []
 NOTEBOOK_COMPARISON_NAME: str | None = None
 
-# Short human-readable descriptions for each feature used in the printed
-# summary. These make it explicit what each feature computes and plots.
 FEATURE_DESCRIPTIONS: dict[str, str] = {
     "beads": "Detects and links beads, computes velocities and optional angular speed; can also render displacement overlay movies and velocity-over-time plots.",
     "autocorr": "Computes FFT-based 2D/3D autocorrelations and radial averages; saves autocorrelation plots.",
     "image_corr": "Computes time-image correlations and fits; saves raw and fitted correlation plots.",
     "vector_corr": "Computes temporal, spatial, and tensor bead-motion vector correlations; can optionally reject Westerweel-Scarano outliers before plotting.",
+    "velocity_spectrum": "Computes velocity spectra from drift-corrected 3D velocity fields and also supports 2D xy vorticity maps and vorticity spectra.",
     "summary": "Writes a feature manifest summarizing which outputs were produced.",
 }
 
@@ -116,26 +132,53 @@ def _read_parquet(path: Path) -> pd.DataFrame:
     return pd.read_parquet(path) if path.exists() else pd.DataFrame()
 
 
+def _result_frame(result: dict[str, Any], *keys: str) -> pd.DataFrame:
+    if not isinstance(result, dict):
+        return pd.DataFrame()
+    for key in keys:
+        value = result.get(key)
+        if isinstance(value, pd.DataFrame):
+            return value
+    return pd.DataFrame()
+
+
 def _finite_limits(values: Sequence[np.ndarray | pd.Series | list[float]], *, pad_fraction: float = 0.06) -> tuple[float, float] | None:
     finite_parts = []
     for value in values:
-        array = np.asarray(value, dtype=float).ravel()
-        array = array[np.isfinite(array)]
-        if array.size:
-            finite_parts.append(array)
+        arr = np.asarray(value, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size:
+            finite_parts.append(arr)
     if not finite_parts:
         return None
 
     combined = np.concatenate(finite_parts)
-    lower = float(np.nanmin(combined))
-    upper = float(np.nanmax(combined))
-    if not np.isfinite(lower) or not np.isfinite(upper):
+    lo = float(np.nanmin(combined))
+    hi = float(np.nanmax(combined))
+    if not np.isfinite(lo) or not np.isfinite(hi):
         return None
-    if lower == upper:
-        margin = 1.0 if lower == 0.0 else abs(lower) * 0.1
-        return lower - margin, upper + margin
-    margin = (upper - lower) * float(pad_fraction)
-    return lower - margin, upper + margin
+    if lo == hi:
+        delta = abs(lo) * pad_fraction if lo != 0 else pad_fraction
+        return lo - delta, hi + delta
+    span = hi - lo
+    pad = span * pad_fraction
+    return lo - pad, hi + pad
+
+
+def _config_bool(config: dict[str, Any], key: str, default: bool = False) -> bool:
+    value = config.get(key, default)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _config_str_list(config: dict[str, Any], key: str, default: list[str] | None = None) -> list[str]:
+    value = config.get(key, default if default is not None else [])
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return [str(item) for item in value]
 
 
 def _range_from_config(min_value: Any, max_value: Any) -> tuple[float | None, float | None] | None:
@@ -146,358 +189,10 @@ def _range_from_config(min_value: Any, max_value: Any) -> tuple[float | None, fl
     return lower, upper
 
 
-def _result_frame(result: dict[str, Any], *keys: str) -> pd.DataFrame:
-    for key in keys:
-        value = result.get(key)
-        if isinstance(value, pd.DataFrame):
-            return value
-    return pd.DataFrame()
-
-
-def _exp_decay(x: np.ndarray, amplitude: float, xi: float, offset: float) -> np.ndarray:
-    x = np.asarray(x, dtype=float)
-    xi = max(float(xi), 1e-12)
-    return float(amplitude) * np.exp(-np.clip(x, 0.0, None) / xi) + float(offset)
-
-
-def _fit_decay_curve(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray | None, float | None]:
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    mask = np.isfinite(x) & np.isfinite(y)
-    if int(mask.sum()) < 4:
-        return None, None
-
-    x_fit = x[mask]
-    y_fit = y[mask]
-    positive = x_fit > 0.0
-    if int(positive.sum()) >= 3:
-        x_fit = x_fit[positive]
-        y_fit = y_fit[positive]
-    if x_fit.size < 4:
-        return None, None
-
-    amplitude_guess = max(0.05, float(np.nanmax(y_fit) - np.nanmin(y_fit)))
-    xi_guess = max(1e-3, float(np.nanmedian(x_fit)))
-    offset_guess = float(np.nanmin(y_fit))
-
-    try:
-        popt, _ = curve_fit(
-            _exp_decay,
-            x_fit,
-            y_fit,
-            p0=[amplitude_guess, xi_guess, offset_guess],
-            bounds=([0.0, 1e-12, -np.inf], [np.inf, np.inf, np.inf]),
-            maxfev=20000,
-        )
-        return popt, float(popt[1])
-    except Exception:
-        return None, None
-
-
-def _fit_signed_decay(
-    x: np.ndarray,
-    y: np.ndarray,
-    *,
-    yerr: np.ndarray | None = None,
-    fit_range: tuple[float | None, float | None] | None = None,
-    min_points: int = 4,
-) -> tuple[np.ndarray | None, float | None, float | None]:
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    mask = np.isfinite(x) & np.isfinite(y) & (x > 0)
-    if fit_range is not None:
-        lower, upper = fit_range
-        if lower is not None:
-            mask &= x >= float(lower)
-        if upper is not None:
-            mask &= x <= float(upper)
-
-    if yerr is not None:
-        yerr = np.asarray(yerr, dtype=float)
-        mask &= np.isfinite(yerr)
-
-    if int(mask.sum()) < int(min_points):
-        return None, None, None
-
-    x_fit = x[mask]
-    y_fit = y[mask]
-    sigma = np.clip(yerr[mask], 1e-12, None) if yerr is not None else None
-
-    offset_guess = float(np.nanmean(y_fit[-max(3, y_fit.size // 5) :])) if y_fit.size else 0.0
-    if not np.isfinite(offset_guess):
-        offset_guess = 0.0
-    amplitude_guess = float(y_fit[0] - offset_guess) if y_fit.size else 1.0
-    if not np.isfinite(amplitude_guess) or amplitude_guess == 0.0:
-        centered = y_fit - offset_guess
-        amplitude_guess = float(centered[np.nanargmax(np.abs(centered))]) if centered.size else 1.0
-    xi_guess = max(1e-3, float(np.nanmedian(x_fit)))
-
-    try:
-        popt, pcov = curve_fit(
-            _exp_decay,
-            x_fit,
-            y_fit,
-            p0=[amplitude_guess, xi_guess, offset_guess],
-            bounds=([-np.inf, 1e-12, -np.inf], [np.inf, np.inf, np.inf]),
-            sigma=sigma,
-            absolute_sigma=sigma is not None,
-            maxfev=20000,
-        )
-        perr = np.sqrt(np.abs(np.diag(pcov))) if pcov is not None else np.full(popt.shape, np.nan)
-        return popt, float(popt[1]), float(perr[1]) if perr.size > 1 else np.nan
-    except Exception:
-        return None, None, None
-
-
 def _format_math_uncertainty_label(symbol: str, value: float, uncertainty: float | None, unit: str) -> str:
-    if not np.isfinite(value):
-        return rf"${symbol}=\mathrm{{nan}}\,{unit}$"
-
-    if uncertainty is None or not np.isfinite(uncertainty) or float(uncertainty) <= 0.0:
-        return rf"${symbol}={float(value):.3g}\,{unit}$"
-
-    abs_uncertainty = abs(float(uncertainty))
-    if abs_uncertainty >= 1.0:
-        value_decimals = 0
-        uncertainty_decimals = 1
-    else:
-        uncertainty_decimals = min(3, max(1, int(np.ceil(-np.log10(abs_uncertainty))) + 1))
-        value_decimals = uncertainty_decimals
-
-    value_str = f"{float(value):.{value_decimals}f}"
-    uncertainty_str = f"{abs_uncertainty:.{uncertainty_decimals}f}"
-    return rf"${symbol}={value_str}\pm{uncertainty_str}\,{unit}$"
-
-
-def _plot_autocorr_weighted_near0_profile(
-    ax: Axes,
-    df: pd.DataFrame,
-    *,
-    title: str | None = None,
-    x_range: tuple[float | None, float | None] | None = None,
-) -> None:
-    def _profile_from_subset(subset: pd.DataFrame) -> pd.DataFrame:
-        return (
-            subset.dropna(subset=["r_um", "corr"])
-            .groupby("r_um", as_index=False)
-            .agg(corr_median=("corr", "median"), corr_mean=("corr", "mean"), n=("corr", "size"))
-            .sort_values("r_um")
-        )
-
-    def _stored_fit_from_subset(subset: pd.DataFrame) -> dict[str, float] | None:
-        if not {"xi_um", "amp", "offset"}.issubset(subset.columns):
-            return None
-
-        xi_values = subset["xi_um"].to_numpy(dtype=float)
-        xi_values = xi_values[np.isfinite(xi_values)]
-        if not xi_values.size:
-            return None
-
-        xi_err_values = subset["xi_err_um"].to_numpy(dtype=float) if "xi_err_um" in subset.columns else np.array([], dtype=float)
-        xi_err_values = xi_err_values[np.isfinite(xi_err_values)] if xi_err_values.size else np.array([], dtype=float)
-
-        amp_values = subset["amp"].to_numpy(dtype=float)
-        amp_values = amp_values[np.isfinite(amp_values)]
-        offset_values = subset["offset"].to_numpy(dtype=float)
-        offset_values = offset_values[np.isfinite(offset_values)]
-        if not amp_values.size or not offset_values.size:
-            return None
-
-        return {
-            "xi": float(np.nanmedian(xi_values)),
-            "xi_err": float(np.nanmedian(xi_err_values)) if xi_err_values.size else np.nan,
-            "amp": float(np.nanmedian(amp_values)),
-            "offset": float(np.nanmedian(offset_values)),
-        }
-
-    def _exp_decay_local(x: np.ndarray, amplitude: float, xi: float, offset: float) -> np.ndarray:
-        x = np.asarray(x, dtype=float)
-        xi = max(float(xi), 1e-12)
-        return float(amplitude) * np.exp(-x / xi) + float(offset)
-
-    has_frames = "frame" in df.columns and df["frame"].nunique(dropna=True) > 1
-    x_series: list[np.ndarray] = []
-    y_series: list[np.ndarray] = []
-    source_line = None
-
-    if has_frames:
-        frame_values = sorted({int(frame) for frame in df["frame"].dropna().astype(int).tolist()})
-        cmap = plt.get_cmap("viridis")
-        colors = [cmap(value) for value in np.linspace(0.15, 0.95, max(1, len(frame_values)))]
-        for frame, color in zip(frame_values, colors):
-            frame_subset = df.loc[df["frame"] == frame]
-            frame_profile = _profile_from_subset(frame_subset)
-            if frame_profile.empty:
-                continue
-            x_data = frame_profile["r_um"].to_numpy(dtype=float)
-            y_data = frame_profile["corr_median"].to_numpy(dtype=float)
-            time_minutes = None
-            if "time_s" in frame_subset.columns:
-                time_values = frame_subset["time_s"].dropna().astype(float)
-                if time_values.size:
-                    time_minutes = float(time_values.iloc[0]) / 60.0
-            if x_range is not None:
-                lower, upper = x_range
-                mask = np.isfinite(x_data) & np.isfinite(y_data)
-                if lower is not None:
-                    mask &= x_data >= float(lower)
-                if upper is not None:
-                    mask &= x_data <= float(upper)
-                x_data = x_data[mask]
-                y_data = y_data[mask]
-                frame_profile = frame_profile.loc[mask].copy()
-            if x_data.size == 0:
-                continue
-            x_series.append(x_data)
-            y_series.append(y_data)
-            fit_df = frame_profile[frame_profile["r_um"] > 0].copy()
-            r = fit_df["r_um"].to_numpy(dtype=float)
-            y = fit_df["corr_median"].to_numpy(dtype=float)
-            label = f"t={time_minutes:.2f} min" if time_minutes is not None else f"t={frame} min"
-
-            stored_fit = _stored_fit_from_subset(frame_subset)
-            if stored_fit is not None:
-                xi_label = _format_math_uncertainty_label(r"\xi", stored_fit["xi"], stored_fit["xi_err"], r"\mu\mathrm{m}")
-                label = f"t={time_minutes:.2f} min {xi_label}" if time_minutes is not None else f"t={frame} min {xi_label}"
-                x_fit = np.linspace(float(np.nanmin(x_data)), float(np.nanmax(x_data)), 240)
-                ax.plot(x_fit, _exp_decay_local(x_fit, stored_fit["amp"], stored_fit["xi"], stored_fit["offset"]), lw=1.4, ls="--", color=color, alpha=0.75)
-            elif r.size >= 4 and y.size >= 4:
-                amplitude_guess = max(1e-3, float(np.nanmax(y) - np.nanmin(y)))
-                xi_guess = max(0.1, float(np.nanmax(r)) / 8.0)
-                offset_guess = float(np.nanmin(y))
-                alpha = 2.5 / max(float(np.nanmax(r)), 1e-6)
-                sigma_near0 = 0.2 + alpha * r
-
-                try:
-                    popt, pcov = curve_fit(
-                        _exp_decay_local,
-                        r,
-                        y,
-                        p0=[amplitude_guess, xi_guess, offset_guess],
-                        bounds=([0.0, 0.01, -np.inf], [np.inf, np.inf, np.inf]),
-                        sigma=sigma_near0,
-                        absolute_sigma=False,
-                        maxfev=30000,
-                    )
-                    perr = np.sqrt(np.abs(np.diag(pcov))) if pcov is not None else np.full(popt.shape, np.nan)
-                    xi_err = float(perr[1]) if perr.size > 1 and np.isfinite(perr[1]) else None
-                    xi_label = _format_math_uncertainty_label(r"\xi", float(popt[1]), xi_err, r"\mu\mathrm{m}")
-                    label = f"t={time_minutes:.2f} min {xi_label}" if time_minutes is not None else f"t={frame} min {xi_label}"
-                    x_fit = np.linspace(float(np.nanmin(x_data)), float(np.nanmax(x_data)), 240)
-                    ax.plot(x_fit, _exp_decay_local(x_fit, *popt), lw=1.4, ls="--", color=color, alpha=0.75)
-                except Exception:
-                    pass
-
-            ax.plot(x_data, y_data, "o-", ms=3, lw=1.8, alpha=0.88, color=color, label=label)
-
-        profile = pd.DataFrame()
-    else:
-        profile = _profile_from_subset(df)
-        if profile.empty:
-            ax.set_title(title or "")
-            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
-            return
-        x_data = profile["r_um"].to_numpy(dtype=float)
-        y_data = profile["corr_median"].to_numpy(dtype=float)
-        if x_range is not None:
-            lower, upper = x_range
-            mask = np.isfinite(x_data) & np.isfinite(y_data)
-            if lower is not None:
-                mask &= x_data >= float(lower)
-            if upper is not None:
-                mask &= x_data <= float(upper)
-            x_data = x_data[mask]
-            y_data = y_data[mask]
-            profile = profile.loc[mask].copy()
-        if x_data.size == 0:
-            ax.set_title(title or "")
-            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
-            return
-        x_series.append(x_data)
-        y_series.append(y_data)
-        source_line = ax.plot(x_data, y_data, "o", ms=3, alpha=0.85, label="median profile")[0]
-
-    if not has_frames:
-        stored_fit = _stored_fit_from_subset(df)
-        if stored_fit is not None:
-            fit_color = source_line.get_color() if source_line is not None else "tab:blue"
-            x_fit_min = 0.0
-            x_fit_max = float(np.nanmax(profile["r_um"]))
-            if x_range is not None:
-                lower, upper = x_range
-                if lower is not None:
-                    x_fit_min = max(x_fit_min, float(lower))
-                if upper is not None:
-                    x_fit_max = min(x_fit_max, float(upper))
-            x_fit = np.linspace(x_fit_min, x_fit_max, 600)
-            y_fit = _exp_decay_local(x_fit, stored_fit["amp"], stored_fit["xi"], stored_fit["offset"])
-            ax.plot(x_fit, y_fit, lw=2, ls="--", color=fit_color, alpha=0.9)
-            xi_label = _format_math_uncertainty_label(r"\xi", stored_fit["xi"], stored_fit["xi_err"], r"\mu\mathrm{m}")
-            if source_line is not None:
-                source_line.set_label(f"median profile {xi_label}")
-        else:
-            fit_df = profile[profile["r_um"] > 0].copy()
-            r = fit_df["r_um"].to_numpy(dtype=float)
-            y = fit_df["corr_median"].to_numpy(dtype=float)
-            if r.size < 4 or y.size < 4:
-                ax.set_title(title or "")
-                ax.text(0.5, 0.5, "no fit", ha="center", va="center", transform=ax.transAxes)
-                return
-
-            amplitude_guess = max(1e-3, float(np.nanmax(y) - np.nanmin(y)))
-            xi_guess = max(0.1, float(np.nanmax(r)) / 8.0)
-            offset_guess = float(np.nanmin(y))
-            alpha = 2.5 / max(float(np.nanmax(r)), 1e-6)
-            sigma_near0 = 0.2 + alpha * r
-
-            try:
-                popt, pcov = curve_fit(
-                    _exp_decay_local,
-                    r,
-                    y,
-                    p0=[amplitude_guess, xi_guess, offset_guess],
-                    bounds=([0.0, 0.01, -np.inf], [np.inf, np.inf, np.inf]),
-                    sigma=sigma_near0,
-                    absolute_sigma=False,
-                    maxfev=30000,
-                )
-                perr = np.sqrt(np.abs(np.diag(pcov))) if pcov is not None else np.full(popt.shape, np.nan)
-                sigma_err = float(perr[1]) if perr.size > 1 and np.isfinite(perr[1]) else None
-            except Exception:
-                ax.set_title(title or "")
-                ax.text(0.5, 0.5, "fit failed", ha="center", va="center", transform=ax.transAxes)
-                return
-
-            x_fit_min = 0.0
-            x_fit_max = float(np.nanmax(profile["r_um"]))
-            if x_range is not None:
-                lower, upper = x_range
-                if lower is not None:
-                    x_fit_min = max(x_fit_min, float(lower))
-                if upper is not None:
-                    x_fit_max = min(x_fit_max, float(upper))
-            x_fit = np.linspace(x_fit_min, x_fit_max, 600)
-            y_fit = _exp_decay_local(x_fit, *popt)
-
-            fit_color = source_line.get_color() if source_line is not None else "tab:blue"
-            ax.plot(x_fit, y_fit, lw=2, ls="--", color=fit_color, alpha=0.9)
-            xi_label = _format_math_uncertainty_label(r"\xi", float(popt[1]), sigma_err, r"\mu\mathrm{m}")
-            if source_line is not None:
-                source_line.set_label(f"median profile {xi_label}")
-
-    if title:
-        ax.set_title(title)
-    ax.set_xlabel(r"distance ($\mu\mathrm{m}$)")
-    ax.set_ylabel("corr")
-    ax.grid(True, alpha=0.25)
-    ax.legend(frameon=True)
-
-    x_limits = _finite_limits(x_series)
-    y_limits = _finite_limits(y_series)
-    if x_limits is not None:
-        ax.set_xlim(*x_limits)
-    if y_limits is not None:
-        ax.set_ylim(*y_limits)
+    if uncertainty is None or not np.isfinite(uncertainty):
+        return rf"${symbol}={value:.3g}\,{unit}$"
+    return rf"${symbol}={value:.3g}\pm{uncertainty:.2g}\,{unit}$"
 
 
 def _format_group_label(group_cols: list[str], group_key: object) -> str:
@@ -541,6 +236,7 @@ def _grouped_line_plot(
     grouped = list(df.groupby(group_cols, sort=True)) if group_cols else [("all", df)]
 
     cmap = plt.get_cmap("viridis")
+
     def _group_sort_key(item: tuple[object, pd.DataFrame]) -> tuple[float, str, str]:
         group_key, group_df = item
         order_value = float("inf")
@@ -555,6 +251,7 @@ def _grouped_line_plot(
     colors = [cmap(value) for value in np.linspace(0.15, 0.95, max(1, len(grouped)))]
     x_series: list[np.ndarray] = []
     y_series: list[np.ndarray] = []
+
     for (group_key, group_df), color in zip(grouped, colors):
         sub = group_df.sort_values(x_col)
         x = sub[x_col].to_numpy(dtype=float)
@@ -569,13 +266,24 @@ def _grouped_line_plot(
             x = x[mask]
             y = y[mask]
             sub = sub.loc[mask]
+        else:
+            mask = np.isfinite(x) & np.isfinite(y)
+            x = x[mask]
+            y = y[mask]
+            sub = sub.loc[mask]
+
+        if x.size == 0:
+            continue
+
         x_series.append(x)
         y_series.append(y)
+
         if label_col is not None and label_col in sub.columns:
             label_values = sub[label_col].dropna().astype(str)
             group_label = str(label_values.iloc[0]) if not label_values.empty else _format_group_label(group_cols, group_key)
         else:
             group_label = _format_group_label(group_cols, group_key)
+
         line_color = color
         if color_col is not None and color_col in sub.columns:
             color_values = sub[color_col].dropna().astype(str)
@@ -583,6 +291,7 @@ def _grouped_line_plot(
                 color_value = color_values.iloc[0].strip()
                 if color_value:
                     line_color = color_value
+
         ax.plot(x, y, lw=1.8, color=line_color, label=group_label)
 
         if band_col is not None and band_col in sub.columns:
@@ -654,6 +363,20 @@ def _grouped_line_plot(
                             else:
                                 fit_label = rf"{group_label} fit ($\tau={fit_value:.2g}\,{unit}$)"
                     ax.plot(x_fit, y_fit, ls="--", lw=1.4, color=line_color, alpha=0.85, label=fit_label)
+
+    if title:
+        ax.set_title(title)
+    ax.set_xlabel(r"distance ($\mu\mathrm{m}$)" if x_col == "r_um" else x_col)
+    ax.set_ylabel(y_col)
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=True)
+
+    x_limits = _finite_limits(x_series)
+    y_limits = _finite_limits(y_series)
+    if x_limits is not None:
+        ax.set_xlim(*x_limits)
+    if y_limits is not None:
+        ax.set_ylim(*y_limits)
 
     if title:
         ax.set_title(title)
@@ -1392,6 +1115,18 @@ def _plot_autocorr_length_time_series(
         ax.set_ylim(*y_limits)
 
 
+def _plot_autocorr_weighted_near0_profile(
+    ax: Axes,
+    df: pd.DataFrame,
+    *,
+    title: str | None = None,
+    x_range: tuple[float | None, float | None] | None = None,
+) -> None:
+    x_col = "r_um" if "r_um" in df.columns else df.columns[0]
+    y_col = "corr" if "corr" in df.columns else ("corr_mean" if "corr_mean" in df.columns else (df.columns[1] if len(df.columns) > 1 else x_col))
+    _grouped_line_plot(ax, df, x_col, y_col=y_col, title=title, x_range=x_range)
+
+
 def _comparison_sort_key(spec: ComparisonSpec) -> tuple[float, str, str]:
     label = str(spec.label).strip()
     match = re.search(r"(-?\d+(?:\.\d+)?)\s*nM", label, flags=re.IGNORECASE)
@@ -1433,6 +1168,10 @@ def run_batch_comparison(
     reference_cfg = records[0][1].config
     variation = str(reference_cfg.get("dataset", {}).get("variation", ""))
     comparison_cfg = dict(reference_cfg.get("comparison", {})) if isinstance(reference_cfg.get("comparison", {}), dict) else {}
+    vector_cfg = dict(reference_cfg.get("vector_corr", {})) if isinstance(reference_cfg.get("vector_corr", {}), dict) else {}
+    plot_velocity_over_time_enabled = _config_bool(comparison_cfg, "plot_velocity_over_time_enabled", True)
+    plot_drift_velocity_over_time_enabled = _config_bool(comparison_cfg, "drift_velocity_over_time_enabled", False)
+    plot_mean_speed_summary_enabled = _config_bool(comparison_cfg, "plot_mean_speed_summary_enabled", True)
     autocorr_sample_mode_raw = str(comparison_cfg.get("autocorr_sample_mode", "mean")).strip().lower()
     autocorr_sample_mode = "frame" if autocorr_sample_mode_raw in {"sample", "frame", "single"} else "mean"
     autocorr_sample_frame_raw = comparison_cfg.get("autocorr_sample_frame")
@@ -1440,6 +1179,7 @@ def run_batch_comparison(
     out_dir = comparison_output_dir(output_root, comparison_name, variation=variation)
     saved: dict[str, dict[str, Path]] = {}
     sorted_records = sorted(records, key=lambda item: _comparison_sort_key(item[0]))
+    autocorr_xi_rows: list[dict[str, Any]] = []
 
     tensor_sample_suffix = None
     for _, runner in sorted_records:
@@ -1520,7 +1260,7 @@ def run_batch_comparison(
         drift_series["legend_label"] = f"{spec.label} {drift_velocity_label}"
         drift_velocity_parts.append(drift_series[["time_s", "corr", "corr_std", "dataset_order", "dataset_color", "legend_label"]])
 
-    if velocity_parts:
+    if plot_velocity_over_time_enabled and velocity_parts:
         vel_cmp = pd.concat(velocity_parts, ignore_index=True)
         with comparison_style_context("dark"):
             fig, ax = plt.subplots(figsize=(8.0, 4.8), dpi=150)
@@ -1545,8 +1285,7 @@ def run_batch_comparison(
             saved[stem] = save_comparison_dual_pdf(fig, out_dir, stem, white_plot_fn=_white_velocity)
             plt.close(fig)
 
-    drift_velocity_enabled = bool(comparison_cfg.get("drift_velocity_over_time_enabled", False))
-    if drift_velocity_enabled and drift_velocity_parts:
+    if plot_drift_velocity_over_time_enabled and drift_velocity_parts:
         drift_vel_cmp = pd.concat(drift_velocity_parts, ignore_index=True)
         with comparison_style_context("dark"):
             fig, ax = plt.subplots(figsize=(8.0, 4.8), dpi=150)
@@ -1571,7 +1310,7 @@ def run_batch_comparison(
             saved[stem] = save_comparison_dual_pdf(fig, out_dir, stem, white_plot_fn=_white_drift_velocity)
             plt.close(fig)
 
-    if speed_summary_rows:
+    if plot_mean_speed_summary_enabled and speed_summary_rows:
         speed_summary_df = pd.DataFrame(speed_summary_rows).drop_duplicates(subset=["dataset_id"], keep="last")
         with comparison_style_context("dark"):
             fig, ax = plt.subplots(figsize=(7.4, 4.8), dpi=150)
@@ -1598,178 +1337,146 @@ def run_batch_comparison(
             saved[stem] = save_comparison_dual_pdf(fig, out_dir, stem, white_plot_fn=_white_speed_summary)
             plt.close(fig)
 
-    autocorr_cfg = dict(reference_cfg.get("autocorr", {}))
-    autocorr_plot_range = _range_from_config(autocorr_cfg.get("plot_r_um_min"), autocorr_cfg.get("plot_r_um_max"))
-    autocorr_xi_rows: list[dict[str, Any]] = []
-    autocorr_time_rows: list[dict[str, Any]] = []
-    autocorr_maps = (
-        ("single3d_df", "autocorr_3d_single_frame.parquet", "r_um", "3D autocorrelation, single frame"),
-        ("sampled3d_df", "autocorr_3d_sampled.parquet", "r_um", "3D autocorrelation, sampled frames"),
-        ("sampled2d_df", "autocorr_2d_sampled.parquet", "r_um", "2D autocorrelation, sampled frames"),
-        ("radial2d_df", "autocorr_2d_radial_single.parquet", "r_um", "2D radial autocorrelation, single frame"),
-    )
-    for key, filename, x_col, title in autocorr_maps:
-        parts: list[pd.DataFrame] = []
-        key_mode = autocorr_sample_mode if key in {"sampled3d_df", "sampled2d_df"} else "mean"
+    if bool(vector_cfg.get("enabled", True)):
+        comparison_vector_cfg = dict(vector_cfg)
+        comparison_vector_overrides = comparison_cfg.get("vector_corr", {})
+        if isinstance(comparison_vector_overrides, dict):
+            comparison_vector_cfg.update(comparison_vector_overrides)
+        plot_vector_temporal_enabled = _config_bool(comparison_vector_cfg, "plot_temporal_enabled", _config_bool(comparison_vector_cfg, "enabled", True))
+        plot_vector_spatial_enabled = _config_bool(comparison_vector_cfg, "plot_spatial_enabled", _config_bool(comparison_vector_cfg, "enabled", True))
+        plot_tensor_enabled = _config_bool(comparison_vector_cfg, "plot_tensor_enabled", _config_bool(comparison_vector_cfg, "tensor_enabled", True))
+        plot_tensor_parts = set(_config_str_list(comparison_vector_cfg, "plot_tensor_parts", ["full", "symmetric", "antisymmetric"]))
+        plot_tensor_pair_fits_enabled = _config_bool(comparison_vector_cfg, "plot_tensor_pair_fits_enabled", _config_bool(comparison_vector_cfg, "tensor_fit_enabled", False))
+        plot_tensor_time_series_enabled = _config_bool(comparison_vector_cfg, "plot_tensor_time_series_enabled", _config_bool(comparison_vector_cfg, "tensor_time_series_enabled", False))
+        temporal_range = _range_from_config(comparison_vector_cfg.get("temporal_plot_lag_s_min"), comparison_vector_cfg.get("temporal_plot_lag_s_max"))
+        temporal_parts: list[pd.DataFrame] = []
         for dataset_order, (spec, runner) in enumerate(sorted_records):
-            df = _read_output_or_parquet(runner, "autocorr", key, filename)
-            collapsed = _collapse_series_for_comparison(
-                df,
-                x_col,
-                sampled_frame_mode=key_mode,
-                sampled_frame=autocorr_sample_frame,
+            temporal_df = _read_output_or_parquet(
+                runner,
+                "vector_corr",
+                "temporal_vector_corr_df",
+                _velocity_output_name("beads_vector_correlation_temporal.parquet", vector_cfg),
             )
-            if collapsed.empty:
+            if temporal_df.empty or not {"lag_s", "corr"}.issubset(temporal_df.columns):
                 continue
+            grouped = temporal_df.copy()
+            grouped["dataset_order"] = int(dataset_order)
+            grouped["dataset_color"] = spec.color
+            grouped["legend_label"] = spec.label
+            temporal_parts.append(grouped)
 
-            if key == "sampled3d_df" and "xi_um" in collapsed.columns:
-                xi_values = collapsed["xi_um"].to_numpy(dtype=float)
-                xi_values = xi_values[np.isfinite(xi_values)]
-                if xi_values.size:
-                    xi_err_values = collapsed["xi_err_um"].to_numpy(dtype=float) if "xi_err_um" in collapsed.columns else np.array([], dtype=float)
-                    xi_err_values = xi_err_values[np.isfinite(xi_err_values)]
-                    autocorr_xi_rows.append(
-                        {
-                            "dataset_id": spec.dataset_id,
-                            "dataset_label": spec.label,
-                            "dataset_order": int(dataset_order),
-                            "dataset_color": spec.color,
-                            "xi_um": float(np.nanmedian(xi_values)),
-                            "xi_err_um": float(np.nanmedian(xi_err_values)) if xi_err_values.size else np.nan,
-                        }
-                    )
-
-            collapsed["dataset_order"] = int(dataset_order)
-            collapsed["dataset_color"] = spec.color
-            collapsed["legend_label"] = spec.label
-            parts.append(collapsed)
-
-        if not parts:
-            continue
-
-        merged = pd.concat(parts, ignore_index=True)
-        with comparison_style_context("dark"):
-            fig, ax = plt.subplots(figsize=(8.0, 4.8), dpi=150)
-            _grouped_line_plot(
-                ax,
-                merged,
-                x_col,
-                title=f"{title} comparison",
-                x_range=autocorr_plot_range,
-                label_col="legend_label",
-                band_col="corr_sem" if "corr_sem" in merged.columns else None,
-                fit_value_col="xi_um",
-                fit_error_col="xi_err_um",
-                fit_amplitude_col="amp",
-                fit_offset_col="offset",
-                fit_symbol=r"\xi",
-                fit_unit=r"\mu\mathrm{m}",
-                fit_label_formatter=lambda label, value, error, symbol, unit: f"{label} {_format_math_uncertainty_label(symbol, value, error, unit)}",
-            )
-
-            def _white_autocorr(ax_white: Axes, table=merged, col=x_col) -> None:
-                _grouped_line_plot(
-                    ax_white,
-                    table,
-                    col,
-                    title=None,
-                    x_range=autocorr_plot_range,
-                    label_col="legend_label",
-                    band_col="corr_sem" if "corr_sem" in table.columns else None,
-                    fit_value_col="xi_um",
-                    fit_error_col="xi_err_um",
-                    fit_amplitude_col="amp",
-                    fit_offset_col="offset",
-                    fit_symbol=r"\xi",
-                    fit_unit=r"\mu\mathrm{m}",
-                    fit_label_formatter=lambda label, value, error, symbol, unit: f"{label} {_format_math_uncertainty_label(symbol, value, error, unit)}",
-                )
-
-            stem = f"{comparison_name}_{key}"
-            saved[stem] = save_comparison_dual_pdf(fig, out_dir, stem, white_plot_fn=_white_autocorr)
-            plt.close(fig)
-
-    for key, filename, title in (
-        ("sampled3d_df", "autocorr_3d_sampled.parquet", "3D autocorrelation length over time"),
-        ("sampled2d_df", "autocorr_2d_sampled.parquet", "2D autocorrelation length over time"),
-    ):
-        time_parts: list[pd.DataFrame] = []
-        for dataset_order, (spec, runner) in enumerate(sorted_records):
-            df = _read_output_or_parquet(runner, "autocorr", key, filename)
-            summary = _sampled_autocorr_length_time_series(df)
-            if summary.empty:
-                continue
-            xi_values = summary["xi_um"].to_numpy(dtype=float)
-            xi_values = xi_values[np.isfinite(xi_values)]
-            xi_err_values = summary["xi_err_um"].to_numpy(dtype=float) if "xi_err_um" in summary.columns else np.array([], dtype=float)
-            xi_err_values = xi_err_values[np.isfinite(xi_err_values)] if xi_err_values.size else np.array([], dtype=float)
-            summary = summary.copy()
-            summary["dataset_id"] = spec.dataset_id
-            summary["dataset_label"] = spec.label
-            summary["dataset_order"] = int(dataset_order)
-            summary["dataset_color"] = spec.color
-            summary["legend_label"] = spec.label
-            time_parts.append(summary)
-
-        if not time_parts:
-            continue
-
-        time_cmp = pd.concat(time_parts, ignore_index=True).sort_values(["dataset_order", "time_s"]).reset_index(drop=True)
-        with comparison_style_context("dark"):
-            fig, ax = plt.subplots(figsize=(8.0, 4.8), dpi=150)
-            def _plot_time_series(ax_target: Axes, table: pd.DataFrame, *, use_log: bool) -> None:
-                for dataset_order, dataset_df in table.groupby("dataset_order", sort=True):
-                    dataset_df = dataset_df.sort_values("time_s")
+        if plot_vector_temporal_enabled and temporal_parts:
+            temporal_cmp = pd.concat(temporal_parts, ignore_index=True)
+            with comparison_style_context("dark"):
+                fig, ax = plt.subplots(figsize=(8.0, 4.8), dpi=150)
+                x_series: list[np.ndarray] = []
+                y_series: list[np.ndarray] = []
+                for dataset_order, dataset_df in temporal_cmp.groupby("dataset_order", sort=True):
+                    dataset_df = dataset_df.sort_values("lag_s")
                     if dataset_df.empty:
                         continue
                     color = str(dataset_df["dataset_color"].iloc[0]) if "dataset_color" in dataset_df.columns else None
                     label = str(dataset_df["legend_label"].iloc[0]) if "legend_label" in dataset_df.columns else str(dataset_order)
-                    x = dataset_df["time_s"].to_numpy(dtype=float)
-                    y = dataset_df["xi_um"].to_numpy(dtype=float)
-                    ax_target.plot(x, y, lw=2.0, color=color, label=label)
-                    if "xi_err_um" in dataset_df.columns:
-                        yerr = dataset_df["xi_err_um"].to_numpy(dtype=float)
-                        mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(yerr)
-                        if np.any(mask):
-                            lower = np.maximum(y[mask] - yerr[mask], np.finfo(float).tiny)
-                            upper = y[mask] + yerr[mask]
-                            ax_target.fill_between(x[mask], lower, upper, alpha=0.14, color=color, linewidth=0)
-                ax_target.set_xlabel("time (s)")
-                ax_target.set_ylabel(r"autocorr length ($\mu\mathrm{m}$)")
-                if use_log:
-                    ax_target.set_yscale("log")
-                y_values = table["xi_um"].to_numpy(dtype=float)
-                y_values = y_values[np.isfinite(y_values)]
-                if y_values.size:
-                    y_min = float(np.nanmin(y_values))
-                    y_max = float(np.nanmax(y_values))
-                    if use_log:
-                        ax_target.set_ylim(max(y_min * 0.8, np.finfo(float).tiny), y_max * 1.2)
-                    else:
-                        y_pad = 0.08 * (y_max - y_min) if not np.isclose(y_min, y_max) else max(abs(y_min) * 0.1, 0.5)
-                        ax_target.set_ylim(y_min - y_pad, y_max + y_pad)
-                x_all = table["time_s"].to_numpy(dtype=float)
-                x_all = x_all[np.isfinite(x_all)]
-                if x_all.size:
-                    x_min = float(np.nanmin(x_all))
-                    x_max = float(np.nanmax(x_all))
-                    if np.isclose(x_min, x_max):
-                        ax_target.set_xlim(x_min - 0.5, x_max + 0.5)
-                    else:
-                        pad = 0.05 * (x_max - x_min)
-                        ax_target.set_xlim(x_min - pad, x_max + pad)
-                ax_target.grid(True, alpha=0.25)
-                ax_target.legend(frameon=True)
+                    x = dataset_df["lag_s"].to_numpy(dtype=float)
+                    y = dataset_df["corr"].to_numpy(dtype=float)
+                    yerr = dataset_df["corr_std"].to_numpy(dtype=float) if "corr_std" in dataset_df.columns else None
+                    mask = np.isfinite(x) & np.isfinite(y)
+                    if temporal_range is not None:
+                        lower, upper = temporal_range
+                        if lower is not None:
+                            mask &= x >= float(lower)
+                        if upper is not None:
+                            mask &= x <= float(upper)
+                    x = x[mask]
+                    y = y[mask]
+                    if yerr is not None:
+                        yerr = yerr[mask]
+                    if x.size == 0:
+                        continue
+                    x_series.append(x)
+                    y_series.append(y)
 
-            _plot_time_series(ax, time_cmp, use_log=True)
-            ax.set_title(f"{title} comparison")
+                    tau_values = dataset_df["tau_str_s"].to_numpy(dtype=float) if "tau_str_s" in dataset_df.columns else np.array([], dtype=float)
+                    tau_values = tau_values[np.isfinite(tau_values)]
+                    tau = float(np.nanmedian(tau_values)) if tau_values.size else np.nan
+                    tau_err_values = dataset_df["tau_err_s"].to_numpy(dtype=float) if "tau_err_s" in dataset_df.columns else np.array([], dtype=float)
+                    tau_err_values = tau_err_values[np.isfinite(tau_err_values)] if tau_err_values.size else np.array([], dtype=float)
+                    tau_err = float(np.nanmedian(tau_err_values)) if tau_err_values.size else np.nan
+                    amp_values = dataset_df["amp"].to_numpy(dtype=float) if "amp" in dataset_df.columns else np.array([], dtype=float)
+                    amp_values = amp_values[np.isfinite(amp_values)] if amp_values.size else np.array([], dtype=float)
+                    offset_values = dataset_df["offset"].to_numpy(dtype=float) if "offset" in dataset_df.columns else np.array([], dtype=float)
+                    offset_values = offset_values[np.isfinite(offset_values)] if offset_values.size else np.array([], dtype=float)
+                    if np.isfinite(tau) and tau > 0 and amp_values.size and offset_values.size:
+                        tau_label = _format_math_uncertainty_label(r"\tau", tau, tau_err, r"\mathrm{s}")
+                        label = f"{label} {tau_label}"
+                        x_fit = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 250)
+                        ax.plot(x_fit, _exp_decay(x_fit, float(np.nanmedian(amp_values)), tau, float(np.nanmedian(offset_values))), ls="--", lw=1.4, color=color, alpha=0.85, label="_nolegend_")
 
-            def _white_time(ax_white: Axes, table=time_cmp) -> None:
-                _plot_time_series(ax_white, table, use_log=True)
+                    ax.plot(x, y, lw=2.0, color=color, label=label)
+                    if yerr is not None and np.any(np.isfinite(yerr)):
+                        yerr = np.where(np.isfinite(yerr), yerr, 0.0)
+                        ax.fill_between(x, y - yerr, y + yerr, alpha=0.14, color=color, linewidth=0)
 
-            stem = f"{comparison_name}_{key}_autocorr_length_over_time"
-            saved[stem] = save_comparison_dual_pdf(fig, out_dir, stem, white_plot_fn=_white_time)
-            plt.close(fig)
+                ax.set_title("Temporal vector correlation comparison")
+                ax.set_xlabel("lag (s)")
+                ax.set_ylabel("correlation")
+                ax.grid(True, alpha=0.25)
+                ax.legend(frameon=True)
+
+                x_limits = _finite_limits(x_series)
+                y_limits = _finite_limits(y_series)
+                if x_limits is not None:
+                    ax.set_xlim(*x_limits)
+                if y_limits is not None:
+                    ax.set_ylim(*y_limits)
+
+                def _white_temporal(ax_white: Axes, table=temporal_cmp) -> None:
+                    x_series_white: list[np.ndarray] = []
+                    y_series_white: list[np.ndarray] = []
+                    for dataset_order, dataset_df in table.groupby("dataset_order", sort=True):
+                        dataset_df = dataset_df.sort_values("lag_s")
+                        if dataset_df.empty:
+                            continue
+                        color = str(dataset_df["dataset_color"].iloc[0]) if "dataset_color" in dataset_df.columns else None
+                        label = str(dataset_df["legend_label"].iloc[0]) if "legend_label" in dataset_df.columns else str(dataset_order)
+                        x = dataset_df["lag_s"].to_numpy(dtype=float)
+                        y = dataset_df["corr"].to_numpy(dtype=float)
+                        yerr = dataset_df["corr_std"].to_numpy(dtype=float) if "corr_std" in dataset_df.columns else None
+                        mask = np.isfinite(x) & np.isfinite(y)
+                        if temporal_range is not None:
+                            lower, upper = temporal_range
+                            if lower is not None:
+                                mask &= x >= float(lower)
+                            if upper is not None:
+                                mask &= x <= float(upper)
+                        x = x[mask]
+                        y = y[mask]
+                        if yerr is not None:
+                            yerr = yerr[mask]
+                        if x.size == 0:
+                            continue
+                        x_series_white.append(x)
+                        y_series_white.append(y)
+                        ax_white.plot(x, y, lw=2.0, color=color, label=label)
+                        if yerr is not None and np.any(np.isfinite(yerr)):
+                            yerr = np.where(np.isfinite(yerr), yerr, 0.0)
+                            ax_white.fill_between(x, np.clip(y - yerr, 1e-30, None), np.clip(y + yerr, 1e-30, None), alpha=0.14, color=color, linewidth=0)
+
+                    ax_white.set_xlabel("lag (s)")
+                    ax_white.set_ylabel("correlation")
+                    ax_white.grid(True, alpha=0.25)
+                    ax_white.legend(frameon=True)
+
+                    x_limits = _finite_limits(x_series_white)
+                    y_limits = _finite_limits(y_series_white)
+                    if x_limits is not None:
+                        ax_white.set_xlim(*x_limits)
+                    if y_limits is not None:
+                        ax_white.set_ylim(*y_limits)
+
+                stem = f"{comparison_name}_vector_temporal_correlation"
+                saved[stem] = save_comparison_dual_pdf(fig, out_dir, stem, white_plot_fn=_white_temporal)
+                plt.close(fig)
 
     if autocorr_xi_rows:
         xi_df = pd.DataFrame(autocorr_xi_rows).drop_duplicates(subset=["dataset_id"], keep="last")
@@ -1826,7 +1533,8 @@ def run_batch_comparison(
                 )
             )
 
-    if raw_parts:
+    plot_image_corr_enabled = _config_bool(dict(reference_cfg.get("image_corr", {})), "enabled", False)
+    if plot_image_corr_enabled and raw_parts:
         raw_cmp = pd.concat(raw_parts, ignore_index=True)
         fit_cmp = pd.concat(fit_parts, ignore_index=True) if fit_parts else pd.DataFrame()
         with comparison_style_context("dark"):
@@ -1841,7 +1549,278 @@ def run_batch_comparison(
             plt.close(fig)
 
     vector_cfg = dict(reference_cfg.get("vector_corr", {}))
-    temporal_range = _range_from_config(vector_cfg.get("temporal_plot_lag_s_min"), vector_cfg.get("temporal_plot_lag_s_max"))
+    spectrum_cfg = dict(reference_cfg.get("velocity_spectrum", {}))
+    comparison_spectrum_overrides = comparison_cfg.get("velocity_spectrum", {})
+    comparison_spectrum_cfg = dict(spectrum_cfg)
+    if isinstance(comparison_spectrum_overrides, dict):
+        comparison_spectrum_cfg.update(comparison_spectrum_overrides)
+    plot_velocity_spectrum_enabled = _config_bool(comparison_spectrum_cfg, "plot_enabled", _config_bool(comparison_spectrum_cfg, "enabled", True))
+    spectrum_plot_range = _range_from_config(comparison_spectrum_cfg.get("plot_k_min"), comparison_spectrum_cfg.get("plot_k_max"))
+
+    spectrum_parts: list[pd.DataFrame] = []
+    for dataset_order, (spec, runner) in enumerate(sorted_records):
+        spectrum_df = _read_output_or_parquet(
+            runner,
+            "velocity_spectrum",
+            "velocity_spectrum_df",
+            velocity_spectrum_output_name("beads_velocity_spectrum.parquet", vector_cfg),
+        )
+        if spectrum_df.empty or not {"k_rad_per_um", "energy_mean"}.intersection(spectrum_df.columns):
+            continue
+        grouped = spectrum_df.copy()
+        grouped["dataset_order"] = int(dataset_order)
+        grouped["dataset_color"] = spec.color
+        grouped["legend_label"] = spec.label
+        spectrum_parts.append(grouped)
+
+    if plot_velocity_spectrum_enabled and spectrum_parts:
+        spectrum_cmp = pd.concat(spectrum_parts, ignore_index=True)
+        with comparison_style_context("dark"):
+            fig, ax = plt.subplots(figsize=(9.4, 4.8), dpi=150)
+            x_series: list[np.ndarray] = []
+            y_series: list[np.ndarray] = []
+            for dataset_order, dataset_df in spectrum_cmp.groupby("dataset_order", sort=True):
+                dataset_df = dataset_df.sort_values("k_rad_per_um")
+                if dataset_df.empty:
+                    continue
+                color = str(dataset_df["dataset_color"].iloc[0]) if "dataset_color" in dataset_df.columns else None
+                label = str(dataset_df["legend_label"].iloc[0]) if "legend_label" in dataset_df.columns else str(dataset_order)
+                x = dataset_df["k_rad_per_um"].to_numpy(dtype=float)
+                if "energy_smooth" in dataset_df.columns:
+                    energy_col = "energy_smooth"
+                elif "energy_mean" in dataset_df.columns:
+                    energy_col = "energy_mean"
+                else:
+                    energy_col = "energy"
+                y = dataset_df[energy_col].to_numpy(dtype=float)
+                yerr = dataset_df["energy_std"].to_numpy(dtype=float) if "energy_std" in dataset_df.columns else (dataset_df["energy_sem"].to_numpy(dtype=float) if "energy_sem" in dataset_df.columns else None)
+                mask = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+                if spectrum_plot_range is not None:
+                    lower, upper = spectrum_plot_range
+                    if lower is not None:
+                        mask &= x >= float(lower)
+                    if upper is not None:
+                        mask &= x <= float(upper)
+                x = x[mask]
+                y = y[mask]
+                if yerr is not None:
+                    yerr = yerr[mask]
+                if x.size == 0:
+                    continue
+                x_series.append(x)
+                y_series.append(y)
+                if yerr is not None and np.any(np.isfinite(yerr)):
+                    yerr = np.where(np.isfinite(yerr), yerr, 0.0)
+                    ax.fill_between(x, np.clip(y - yerr, 1e-30, None), np.clip(y + yerr, 1e-30, None), alpha=0.14, color=color, linewidth=0)
+
+                fit_curve = _velocity_spectrum_fit_power_law_curve(x, y, fit_range=spectrum_plot_range)
+                display_label = label
+                if fit_curve is not None:
+                    x_fit, y_fit, alpha = fit_curve
+                    display_label = f"{label} ($\\alpha={alpha:.2f}$)"
+                    ax.plot(x_fit, y_fit, ls="--", lw=1.5, color=color, alpha=0.95, label="_nolegend_")
+
+                ax.plot(x, y, lw=2.0, color=color, label=display_label)
+
+            ax.set_title("Time-averaged 3D velocity spectrum comparison")
+            ax.set_xlabel(r"wavenumber $k$ ($\mathrm{rad}\,\mu\mathrm{m}^{-1}$)")
+            ax.set_ylabel(r"$E(k)$")
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+            ax.grid(True, which="both", alpha=0.25)
+            ax.legend(frameon=True, loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+
+            x_limits = _velocity_spectrum_log_axis_limits(x_series)
+            y_limits = _velocity_spectrum_log_axis_limits(y_series)
+            if x_limits is not None:
+                ax.set_xlim(*x_limits)
+            if y_limits is not None:
+                ax.set_ylim(*y_limits)
+
+            def _white_spectrum(ax_white: Axes, table=spectrum_cmp) -> None:
+                x_series_white: list[np.ndarray] = []
+                y_series_white: list[np.ndarray] = []
+                for dataset_order, dataset_df in table.groupby("dataset_order", sort=True):
+                    dataset_df = dataset_df.sort_values("k_rad_per_um")
+                    if dataset_df.empty:
+                        continue
+                    color = str(dataset_df["dataset_color"].iloc[0]) if "dataset_color" in dataset_df.columns else None
+                    label = str(dataset_df["legend_label"].iloc[0]) if "legend_label" in dataset_df.columns else str(dataset_order)
+                    x = dataset_df["k_rad_per_um"].to_numpy(dtype=float)
+                    if "energy_smooth" in dataset_df.columns:
+                        energy_col = "energy_smooth"
+                    elif "energy_mean" in dataset_df.columns:
+                        energy_col = "energy_mean"
+                    else:
+                        energy_col = "energy"
+                    y = dataset_df[energy_col].to_numpy(dtype=float)
+                    yerr = dataset_df["energy_std"].to_numpy(dtype=float) if "energy_std" in dataset_df.columns else (dataset_df["energy_sem"].to_numpy(dtype=float) if "energy_sem" in dataset_df.columns else None)
+                    mask = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+                    if spectrum_plot_range is not None:
+                        lower, upper = spectrum_plot_range
+                        if lower is not None:
+                            mask &= x >= float(lower)
+                        if upper is not None:
+                            mask &= x <= float(upper)
+                    x = x[mask]
+                    y = y[mask]
+                    if yerr is not None:
+                        yerr = yerr[mask]
+                    if x.size == 0:
+                        continue
+                    x_series_white.append(x)
+                    y_series_white.append(y)
+                    if yerr is not None and np.any(np.isfinite(yerr)):
+                        yerr = np.where(np.isfinite(yerr), yerr, 0.0)
+                        ax_white.fill_between(x, np.clip(y - yerr, 1e-30, None), np.clip(y + yerr, 1e-30, None), alpha=0.14, color=color, linewidth=0)
+
+                    fit_curve = _velocity_spectrum_fit_power_law_curve(x, y, fit_range=spectrum_plot_range)
+                    display_label = label
+                    if fit_curve is not None:
+                        x_fit, y_fit, alpha = fit_curve
+                        display_label = f"{label} ($\\alpha={alpha:.2f}$)"
+                        ax_white.plot(x_fit, y_fit, ls="--", lw=1.5, color=color, alpha=0.95, label="_nolegend_")
+
+                    ax_white.plot(x, y, lw=2.0, color=color, label=display_label)
+
+                ax_white.set_xlabel(r"wavenumber $k$ ($\mathrm{rad}\,\mu\mathrm{m}^{-1}$)")
+                ax_white.set_ylabel(r"$E(k)$")
+                ax_white.set_xscale("log")
+                ax_white.set_yscale("log")
+                ax_white.grid(True, which="both", alpha=0.25)
+                ax_white.legend(frameon=True, loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+                x_limits = _velocity_spectrum_log_axis_limits(x_series_white)
+                y_limits = _velocity_spectrum_log_axis_limits(y_series_white)
+                if x_limits is not None:
+                    ax_white.set_xlim(*x_limits)
+                if y_limits is not None:
+                    ax_white.set_ylim(*y_limits)
+
+            stem = f"{comparison_name}_velocity_spectrum"
+            saved[stem] = save_comparison_dual_pdf(fig, out_dir, stem, white_plot_fn=_white_spectrum)
+            plt.close(fig)
+
+    vorticity_spectrum_cfg = dict(comparison_cfg.get("vorticity_spectrum", {}))
+    plot_vorticity_spectrum_enabled = _config_bool(vorticity_spectrum_cfg, "plot_enabled", _config_bool(vorticity_spectrum_cfg, "enabled", True))
+    vorticity_spectrum_plot_range = _range_from_config(vorticity_spectrum_cfg.get("plot_k_min"), vorticity_spectrum_cfg.get("plot_k_max"))
+
+    vorticity_spectrum_parts: list[pd.DataFrame] = []
+    for dataset_order, (spec, runner) in enumerate(sorted_records):
+        vorticity_spectrum_df = _read_output_or_parquet(
+            runner,
+            "velocity_spectrum",
+            "velocity_vorticity_spectrum_df",
+            velocity_vorticity_spectrum_output_name("beads_velocity_vorticity_spectrum.parquet", vector_cfg),
+        )
+        if vorticity_spectrum_df.empty or "k_rad_per_um" not in vorticity_spectrum_df.columns:
+            continue
+        grouped = vorticity_spectrum_df.copy()
+        grouped["dataset_order"] = int(dataset_order)
+        grouped["dataset_color"] = spec.color
+        grouped["legend_label"] = spec.label
+        vorticity_spectrum_parts.append(grouped)
+
+    if plot_vorticity_spectrum_enabled and vorticity_spectrum_parts:
+        vorticity_spectrum_cmp = pd.concat(vorticity_spectrum_parts, ignore_index=True)
+        with comparison_style_context("dark"):
+            fig, ax = plt.subplots(figsize=(9.4, 4.8), dpi=150)
+            x_series: list[np.ndarray] = []
+            y_series: list[np.ndarray] = []
+            for dataset_order, dataset_df in vorticity_spectrum_cmp.groupby("dataset_order", sort=True):
+                dataset_df = dataset_df.sort_values("k_rad_per_um")
+                if dataset_df.empty:
+                    continue
+                color = str(dataset_df["dataset_color"].iloc[0]) if "dataset_color" in dataset_df.columns else None
+                label = str(dataset_df["legend_label"].iloc[0]) if "legend_label" in dataset_df.columns else str(dataset_order)
+                x = dataset_df["k_rad_per_um"].to_numpy(dtype=float)
+                if "enstrophy" in dataset_df.columns:
+                    y_col = "enstrophy"
+                elif "energy" in dataset_df.columns:
+                    y_col = "energy"
+                else:
+                    y_col = dataset_df.columns[1]
+                y = dataset_df[y_col].to_numpy(dtype=float)
+                mask = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+                if vorticity_spectrum_plot_range is not None:
+                    lower, upper = vorticity_spectrum_plot_range
+                    if lower is not None:
+                        mask &= x >= float(lower)
+                    if upper is not None:
+                        mask &= x <= float(upper)
+                x = x[mask]
+                y = y[mask]
+                if x.size == 0:
+                    continue
+                x_series.append(x)
+                y_series.append(y)
+                plot_vorticity_spectrum(ax, dataset_df.loc[mask], title=None, label=label, color=color, x_range=vorticity_spectrum_plot_range)
+
+            ax.set_title("2D vorticity spectrum comparison")
+            ax.legend(frameon=True, loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+
+            x_limits = _velocity_spectrum_log_axis_limits(x_series)
+            y_limits = _velocity_spectrum_log_axis_limits(y_series)
+            if x_limits is not None:
+                ax.set_xlim(*x_limits)
+            if y_limits is not None:
+                ax.set_ylim(*y_limits)
+
+            def _white_vorticity_spectrum(ax_white: Axes, table=vorticity_spectrum_cmp) -> None:
+                x_series_white: list[np.ndarray] = []
+                y_series_white: list[np.ndarray] = []
+                for dataset_order, dataset_df in table.groupby("dataset_order", sort=True):
+                    dataset_df = dataset_df.sort_values("k_rad_per_um")
+                    if dataset_df.empty:
+                        continue
+                    color = str(dataset_df["dataset_color"].iloc[0]) if "dataset_color" in dataset_df.columns else None
+                    label = str(dataset_df["legend_label"].iloc[0]) if "legend_label" in dataset_df.columns else str(dataset_order)
+                    x = dataset_df["k_rad_per_um"].to_numpy(dtype=float)
+                    if "enstrophy" in dataset_df.columns:
+                        y_col = "enstrophy"
+                    elif "energy" in dataset_df.columns:
+                        y_col = "energy"
+                    else:
+                        y_col = dataset_df.columns[1]
+                    y = dataset_df[y_col].to_numpy(dtype=float)
+                    mask = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+                    if vorticity_spectrum_plot_range is not None:
+                        lower, upper = vorticity_spectrum_plot_range
+                        if lower is not None:
+                            mask &= x >= float(lower)
+                        if upper is not None:
+                            mask &= x <= float(upper)
+                    x = x[mask]
+                    y = y[mask]
+                    if x.size == 0:
+                        continue
+                    x_series_white.append(x)
+                    y_series_white.append(y)
+                    plot_vorticity_spectrum(ax_white, dataset_df.loc[mask], title=None, label=label, color=color, x_range=vorticity_spectrum_plot_range)
+
+                ax_white.set_title("2D vorticity spectrum comparison")
+                ax_white.legend(frameon=True, loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
+                x_limits = _velocity_spectrum_log_axis_limits(x_series_white)
+                y_limits = _velocity_spectrum_log_axis_limits(y_series_white)
+                if x_limits is not None:
+                    ax_white.set_xlim(*x_limits)
+                if y_limits is not None:
+                    ax_white.set_ylim(*y_limits)
+
+            stem = f"{comparison_name}_vorticity_spectrum"
+            saved[stem] = save_comparison_dual_pdf(fig, out_dir, stem, white_plot_fn=_white_vorticity_spectrum)
+            plt.close(fig)
+
+    comparison_vector_cfg = dict(vector_cfg)
+    comparison_vector_overrides = comparison_cfg.get("vector_corr", {})
+    if isinstance(comparison_vector_overrides, dict):
+        comparison_vector_cfg.update(comparison_vector_overrides)
+    plot_vector_temporal_enabled = _config_bool(comparison_vector_cfg, "plot_temporal_enabled", _config_bool(comparison_vector_cfg, "enabled", True))
+    plot_vector_spatial_enabled = _config_bool(comparison_vector_cfg, "plot_spatial_enabled", _config_bool(comparison_vector_cfg, "enabled", True))
+    plot_tensor_enabled = _config_bool(comparison_vector_cfg, "plot_tensor_enabled", _config_bool(comparison_vector_cfg, "tensor_enabled", True))
+    plot_tensor_parts = set(_config_str_list(comparison_vector_cfg, "plot_tensor_parts", ["full", "symmetric", "antisymmetric"]))
+    plot_tensor_pair_fits_enabled = _config_bool(comparison_vector_cfg, "plot_tensor_pair_fits_enabled", _config_bool(comparison_vector_cfg, "tensor_fit_enabled", False))
+    plot_tensor_time_series_enabled = _config_bool(comparison_vector_cfg, "plot_tensor_time_series_enabled", _config_bool(comparison_vector_cfg, "tensor_time_series_enabled", False))
+    temporal_range = _range_from_config(comparison_vector_cfg.get("temporal_plot_lag_s_min"), comparison_vector_cfg.get("temporal_plot_lag_s_max"))
 
     temporal_parts: list[pd.DataFrame] = []
     for dataset_order, (spec, runner) in enumerate(sorted_records):
@@ -1873,7 +1852,7 @@ def run_batch_comparison(
         grouped["legend_label"] = spec.label
         temporal_parts.append(grouped)
 
-    if temporal_parts:
+    if plot_vector_temporal_enabled and temporal_parts:
         temporal_cmp = pd.concat(temporal_parts, ignore_index=True)
         with comparison_style_context("dark"):
             fig, ax = plt.subplots(figsize=(8.0, 4.8), dpi=150)
@@ -2002,9 +1981,9 @@ def run_batch_comparison(
             saved[stem] = save_comparison_dual_pdf(fig, out_dir, stem, white_plot_fn=_white_temporal)
             plt.close(fig)
 
-    tensor_cfg = vector_cfg
+    tensor_cfg = comparison_vector_cfg
     tensor_fit_enabled = bool(tensor_cfg.get("tensor_fit_enabled", False))
-    tensor_distance_mode = str(vector_cfg.get("tensor_distance_mode", "xyz")).strip().lower()
+    tensor_distance_mode = str(tensor_cfg.get("tensor_distance_mode", "xyz")).strip().lower()
     tensor_fit_range = _range_from_config(
         tensor_cfg.get("tensor_fit_distance_um_min"),
         tensor_cfg.get("tensor_fit_distance_um_max"),
@@ -2029,9 +2008,9 @@ def run_batch_comparison(
                 "vector_corr",
                 tensor_result_key,
                 _velocity_output_name(
-                    "beads_vector_correlation_tensor_avg.parquet" if bool(vector_cfg.get("multi_frame_average", False)) else "beads_vector_correlation_tensor.parquet",
-                    vector_cfg,
-                    distance_mode=str(vector_cfg.get("tensor_distance_mode", "xyz")).strip().lower(),
+                    "beads_vector_correlation_tensor_avg.parquet" if bool(tensor_cfg.get("multi_frame_average", False)) else "beads_vector_correlation_tensor.parquet",
+                    tensor_cfg,
+                    distance_mode=tensor_distance_mode,
                     tensor_basis=tensor_basis,
                 ),
             )
@@ -2140,7 +2119,7 @@ def run_batch_comparison(
                 plt.close(fig)
 
     tensor_time_series_enabled = bool(vector_cfg.get("tensor_time_series_enabled", False))
-    if tensor_time_series_enabled:
+    if plot_tensor_time_series_enabled and tensor_time_series_enabled:
         tensor_time_series_specs = (
             ("cartesian", "symmetric", "xx", "Tensor xx decay length over time"),
             ("cartesian", "antisymmetric", "xy", "Tensor xy decay length over time"),
@@ -2157,7 +2136,7 @@ def run_batch_comparison(
                     tensor_time_series_key,
                     _velocity_output_name(
                         "beads_vector_correlation_tensor_time_series.parquet",
-                        vector_cfg,
+                        tensor_cfg,
                         distance_mode=tensor_distance_mode,
                         tensor_basis=tensor_basis if tensor_basis == "spherical" else None,
                     ),
@@ -2373,6 +2352,13 @@ class AnalysisNotebookRunner:
         return self.outputs
 
     def run_feature(self, name: str) -> Any:
+        switch = self.feature_switches[name]
+        if name == "vector_corr" and not bool(self.config.get("vector_corr", {}).get("enabled", True)):
+            self.outputs[name] = {}
+            return {}
+        if not (switch.compute or switch.plot):
+            self.outputs[name] = {}
+            return {}
         if name == "beads":
             return self._run_beads()
         if name == "autocorr":
@@ -2381,6 +2367,8 @@ class AnalysisNotebookRunner:
             return self._run_image_corr()
         if name == "vector_corr":
             return self._run_vector_corr()
+        if name == "velocity_spectrum":
+            return self._run_velocity_spectrum()
         if name == "summary":
             return self._run_summary()
         raise KeyError(f"Unknown feature: {name}")
@@ -2479,16 +2467,17 @@ class AnalysisNotebookRunner:
         overwrite: bool,
         result: dict[str, Any],
     ) -> None:
-        preview_summary, preview_stats, fig_preview, _ = preview_bead_detection(state, beads_cfg, show=False)
-        result.update({"preview_summary": preview_summary, "preview_stats": preview_stats})
-        dark_path = plot_dir / f"{state['dataset_id']}_bead_preview_dark.pdf"
-        white_path = plot_dir / f"{state['dataset_id']}_bead_preview_white.pdf"
-        fig_preview.savefig(dark_path, dpi=150, bbox_inches="tight")
-        with comparison_style_context("white"):
-            _, _, white_fig, _ = preview_bead_detection(state, beads_cfg, show=False)
-        white_fig.savefig(white_path, dpi=150, bbox_inches="tight")
-        plt.close(white_fig)
-        plt.close(fig_preview)
+        if _config_bool(beads_cfg, "plot_preview_enabled", True):
+            preview_summary, preview_stats, fig_preview, _ = preview_bead_detection(state, beads_cfg, show=False)
+            result.update({"preview_summary": preview_summary, "preview_stats": preview_stats})
+            dark_path = plot_dir / f"{state['dataset_id']}_bead_preview_dark.pdf"
+            white_path = plot_dir / f"{state['dataset_id']}_bead_preview_white.pdf"
+            fig_preview.savefig(dark_path, dpi=150, bbox_inches="tight")
+            with comparison_style_context("white"):
+                _, _, white_fig, _ = preview_bead_detection(state, beads_cfg, show=False)
+            white_fig.savefig(white_path, dpi=150, bbox_inches="tight")
+            plt.close(white_fig)
+            plt.close(fig_preview)
 
         velocity_plot_paths = self._render_bead_velocity_plot(
             state=state,
@@ -2817,9 +2806,10 @@ class AnalysisNotebookRunner:
             [tensor_df, tensor_spherical_df, tensor_time_series_df, tensor_spherical_time_series_df],
             plot_dir,
         )
+        comparison_vector_cfg = vector_cfg
 
         if switch.plot:
-            if not temporal_df.empty:
+            if _config_bool(vector_cfg, "plot_temporal_enabled", True) and not temporal_df.empty:
                 with comparison_style_context("dark"):
                     fig, ax = plt.subplots(figsize=(7.4, 4.8), dpi=150)
                     temporal_plot_range = (
@@ -2856,7 +2846,7 @@ class AnalysisNotebookRunner:
                     print(f"Saved vector temporal correlation plots to {plot_dir}")
                     plt.close(fig)
 
-            if not spatial_df.empty:
+            if _config_bool(vector_cfg, "plot_spatial_enabled", True) and not spatial_df.empty:
                 with comparison_style_context("dark"):
                     fig, ax = plt.subplots(figsize=(7.4, 4.8), dpi=150)
                     spatial_plot_range = (
@@ -2886,6 +2876,12 @@ class AnalysisNotebookRunner:
                     print(f"Saved vector spatial correlation plots to {plot_dir}")
                     plt.close(fig)
 
+            tensor_plot_enabled = _config_bool(vector_cfg, "plot_tensor_enabled", True)
+            tensor_plot_parts = _config_str_list(vector_cfg, "plot_tensor_parts", ["full", "symmetric", "antisymmetric"])
+            plot_tensor_enabled = _config_bool(vector_cfg, "plot_tensor_enabled", tensor_plot_enabled)
+            plot_tensor_parts = set(_config_str_list(vector_cfg, "plot_tensor_parts", list(tensor_plot_parts)))
+            plot_tensor_pair_fits_enabled = _config_bool(vector_cfg, "plot_tensor_pair_fits_enabled", _config_bool(vector_cfg, "tensor_fit_enabled", False))
+            plot_tensor_time_series_enabled = _config_bool(vector_cfg, "plot_tensor_time_series_enabled", _config_bool(vector_cfg, "tensor_time_series_enabled", False))
             tensor_plot_range = _range_from_config(
                 vector_cfg.get("tensor_plot_distance_um_min"),
                 vector_cfg.get("tensor_plot_distance_um_max"),
@@ -2895,13 +2891,15 @@ class AnalysisNotebookRunner:
                 ("spherical", tensor_spherical_df, "Spherical vector tensor correlation", "vector_tensor_correlation_spherical"),
             ]
             for tensor_basis, basis_df, basis_title, stem_prefix in tensor_basis_specs:
-                if basis_df.empty:
+                if not plot_tensor_enabled or basis_df.empty:
                     continue
                 for part, part_title, stem in (
                     ("full", basis_title, f"{stem_prefix}_full"),
                     ("symmetric", ("Symmetric tensor correlation" if tensor_basis == "cartesian" else "Spherical symmetric tensor correlation"), f"{stem_prefix}_symmetric"),
                     ("antisymmetric", ("Antisymmetric tensor correlation" if tensor_basis == "cartesian" else "Spherical antisymmetric tensor correlation"), f"{stem_prefix}_antisymmetric"),
                 ):
+                    if part not in plot_tensor_parts:
+                        continue
                     with comparison_style_context("dark"):
                         fig, ax = plt.subplots(figsize=(8.2, 4.8), dpi=150)
                         plot_vector_tensor_correlation(
@@ -2926,7 +2924,7 @@ class AnalysisNotebookRunner:
                         print(f"Saved tensor vector correlation plots to {plot_dir} ({tensor_basis}, {part})")
                         plt.close(fig)
 
-                if bool(vector_cfg.get("tensor_fit_enabled", False)):
+                if plot_tensor_pair_fits_enabled:
                     tensor_fit_pairs = _tensor_fit_component_pairs_for_basis(
                         [str(pair).strip() for pair in vector_cfg.get("tensor_fit_component_pairs", []) if str(pair).strip()],
                         tensor_basis,
@@ -2994,7 +2992,214 @@ class AnalysisNotebookRunner:
                                 print(f"Saved tensor pair-fit plots to {plot_dir} ({part})")
                                 plt.close(fig)
 
+            if plot_tensor_time_series_enabled:
+                def _plot_tensor_time_series(ax_target: Axes, table: pd.DataFrame, *, title: str | None) -> None:
+                    if table.empty or "time_s" not in table.columns or "xi_um" not in table.columns:
+                        ax_target.set_title(title or "")
+                        ax_target.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax_target.transAxes)
+                        return
+
+                    component_pairs = sorted({str(value) for value in table["component_pair"].dropna().astype(str).tolist() if str(value).strip()})
+                    x_series: list[np.ndarray] = []
+                    y_series: list[np.ndarray] = []
+                    cmap = plt.get_cmap("tab10")
+                    colors = [cmap(index % 10) for index in range(max(1, len(component_pairs)))]
+
+                    for index, component_pair in enumerate(component_pairs):
+                        pair_df = table.loc[table["component_pair"].astype(str) == str(component_pair)].sort_values("time_s")
+                        if pair_df.empty:
+                            continue
+
+                        x = pair_df["time_s"].to_numpy(dtype=float)
+                        y = pair_df["xi_um"].to_numpy(dtype=float)
+                        yerr = pair_df["xi_err_um"].to_numpy(dtype=float) if "xi_err_um" in pair_df.columns else None
+                        color = colors[index % len(colors)]
+
+                        ax_target.plot(x, y, lw=2.0, color=color, label=component_pair)
+                        if yerr is not None and np.any(np.isfinite(yerr)):
+                            yerr = np.where(np.isfinite(yerr), yerr, 0.0)
+                            ax_target.fill_between(x, y - yerr, y + yerr, alpha=0.14, color=color, linewidth=0)
+
+                        x_series.append(x)
+                        y_series.append(y)
+
+                    if title:
+                        ax_target.set_title(title)
+                    ax_target.set_xlabel("time (s)")
+                    ax_target.set_ylabel(r"tensor decay length ($\mu\mathrm{m}$)")
+                    ax_target.grid(True, alpha=0.25)
+                    ax_target.legend(frameon=True)
+
+                    x_limits = _finite_limits(x_series)
+                    y_limits = _finite_limits(y_series)
+                    if x_limits is not None:
+                        ax_target.set_xlim(*x_limits)
+                    if y_limits is not None:
+                        ax_target.set_ylim(*y_limits)
+
+                tensor_time_series_specs = (
+                    ("cartesian", tensor_time_series_df, "Tensor decay length over time"),
+                    ("spherical", tensor_spherical_time_series_df, "Spherical tensor decay length over time"),
+                )
+                for tensor_basis, time_series_df, basis_title in tensor_time_series_specs:
+                    if time_series_df.empty:
+                        continue
+
+                    for part in ("full", "symmetric", "antisymmetric"):
+                        part_df = time_series_df.loc[time_series_df["part"].astype(str) == str(part)].copy()
+                        if part_df.empty:
+                            continue
+
+                        with comparison_style_context("dark"):
+                            fig, ax = plt.subplots(figsize=(8.0, 4.8), dpi=150)
+                            _plot_tensor_time_series(ax, part_df, title=f"{basis_title} ({part})")
+
+                            def _white_tensor_time(ax_white: Axes, df=part_df, plot_title=basis_title, part_name=part) -> None:
+                                _plot_tensor_time_series(ax_white, df, title=None)
+
+                            time_series_stem = _tensor_plot_stem(
+                                dataset_id,
+                                f"tensor_{part}_length_over_time",
+                                vector_cfg,
+                                part_df,
+                                distance_mode=tensor_distance_mode,
+                            )
+                            if tensor_basis == "spherical":
+                                time_series_stem = _tensor_plot_stem(
+                                    dataset_id,
+                                    f"tensor_spherical_{part}_length_over_time",
+                                    vector_cfg,
+                                    part_df,
+                                    distance_mode=tensor_distance_mode,
+                                )
+                            save_vector_correlation_dual_pdf(fig, plot_dir, time_series_stem, white_plot_fn=_white_tensor_time)
+                            print(f"Saved tensor time-series plots to {plot_dir} ({tensor_basis}, {part})")
+                            plt.close(fig)
+
         self.outputs["vector_corr"] = result
+        return result
+
+    def _run_velocity_spectrum(self) -> dict[str, Any]:
+        switch = self.feature_switches["velocity_spectrum"]
+        dataset_cfg = self.config.get("dataset", {})
+        vector_cfg = dict(self.config.get("vector_corr", {}))
+        spectrum_cfg = dict(self.config.get("velocity_spectrum", {}))
+        xy_vorticity_cfg = dict(spectrum_cfg.get("xy_vorticity", {}))
+        xy_vorticity_spectrum_cfg = dict(xy_vorticity_cfg.get("spectrum", {}))
+        dataset_id = str(dataset_cfg.get("dataset_id", ""))
+        variation = str(dataset_cfg.get("variation", ""))
+        derived_dir = Path("data") / dataset_id / "derived"
+        plot_dir = _ensure_dir(Path("plots") / dataset_id / variation / "velocity_spectrum")
+
+        spectrum_name = velocity_spectrum_output_name("beads_velocity_spectrum.parquet", vector_cfg)
+        spectrum_frames_name = velocity_spectrum_output_name("beads_velocity_spectrum_frames.parquet", vector_cfg)
+        vorticity_name = velocity_vorticity_output_name("beads_velocity_vorticity_xy.parquet", vector_cfg)
+        vorticity_spectrum_name = velocity_vorticity_spectrum_output_name("beads_velocity_vorticity_spectrum.parquet", vector_cfg)
+
+        if switch.compute:
+            state = self.load_state()
+            derived_dir = Path(state["paths"]["derived_dir"])
+            plot_dir = _ensure_dir(Path(state["paths"]["plots_dir"]) / "velocity_spectrum")
+            result = run_velocity_spectrum_core(self.config, state=state, overrides=self._runtime_overrides("velocity_spectrum"))
+        else:
+            result = {
+                "velocity_spectrum_df": _read_parquet(derived_dir / spectrum_name),
+                "velocity_spectrum_frames_df": _read_parquet(derived_dir / spectrum_frames_name),
+                "velocity_vorticity_df": _read_parquet(derived_dir / vorticity_name),
+                "velocity_vorticity_spectrum_df": _read_parquet(derived_dir / vorticity_spectrum_name),
+            }
+
+        spectrum_df = _result_frame(result, "velocity_spectrum_df")
+        frame_spectrum_df = _result_frame(result, "velocity_spectrum_frames_df")
+        vorticity_df = _result_frame(result, "velocity_vorticity_df")
+        vorticity_spectrum_df = _result_frame(result, "velocity_vorticity_spectrum_df")
+        if not spectrum_df.empty:
+            print(f"Velocity spectrum loaded: {len(spectrum_df)} wavenumber bins")
+        if not frame_spectrum_df.empty:
+            print(f"Velocity spectrum frame table loaded: {len(frame_spectrum_df)} rows")
+        if not vorticity_df.empty:
+            print(f"Velocity vorticity map loaded: {len(vorticity_df)} grid cells")
+        if not vorticity_spectrum_df.empty:
+            print(f"Velocity vorticity spectrum loaded: {len(vorticity_spectrum_df)} wavenumber bins")
+
+        if switch.plot and not spectrum_df.empty:
+            plot_range = _range_from_config(spectrum_cfg.get("plot_k_min"), spectrum_cfg.get("plot_k_max"))
+            with comparison_style_context("dark"):
+                fig, ax = plt.subplots(figsize=(7.4, 4.8), dpi=150)
+                plot_velocity_spectrum(
+                    ax,
+                    spectrum_df,
+                    title="3D time-averaged velocity spectrum",
+                    x_range=plot_range,
+                )
+
+                def _white_velocity_spectrum(ax_white: Axes, df=spectrum_df) -> None:
+                    plot_velocity_spectrum(
+                        ax_white,
+                        df,
+                        title=None,
+                        x_range=plot_range,
+                    )
+
+                stem = velocity_spectrum_artifact_stem(f"{dataset_id}_velocity_spectrum", vector_cfg)
+                save_comparison_dual_pdf(fig, plot_dir, stem, white_plot_fn=_white_velocity_spectrum)
+                plt.close(fig)
+
+        if switch.plot and bool(xy_vorticity_cfg.get("enabled", False)) and bool(xy_vorticity_cfg.get("plot_enabled", True)) and not vorticity_df.empty:
+            quiver_stride = int(xy_vorticity_cfg.get("quiver_stride", 3))
+            quiver_scale = xy_vorticity_cfg.get("quiver_scale")
+            color_map = str(xy_vorticity_cfg.get("colormap", "RdBu_r"))
+            frame_value = int(vorticity_df["frame"].iloc[0]) if "frame" in vorticity_df.columns and not vorticity_df.empty else -1
+            title = f"XY vorticity overlay, frame {frame_value}"
+            with comparison_style_context("dark"):
+                fig, ax = plt.subplots(figsize=(7.8, 6.0), dpi=150)
+                plot_xy_vorticity_overlay(
+                    ax,
+                    vorticity_df,
+                    title=title,
+                    quiver_stride=quiver_stride,
+                    quiver_scale=float(quiver_scale) if quiver_scale is not None else None,
+                    cmap=color_map,
+                )
+
+                def _white_vorticity(ax_white: Axes, df=vorticity_df) -> None:
+                    plot_xy_vorticity_overlay(
+                        ax_white,
+                        df,
+                        title=None,
+                        quiver_stride=quiver_stride,
+                        quiver_scale=float(quiver_scale) if quiver_scale is not None else None,
+                        cmap=color_map,
+                    )
+
+                stem = velocity_vorticity_artifact_stem(f"{dataset_id}_velocity_vorticity_xy", vector_cfg)
+                save_comparison_dual_pdf(fig, plot_dir, stem, white_plot_fn=_white_vorticity)
+                plt.close(fig)
+
+        if switch.plot and bool(xy_vorticity_spectrum_cfg.get("enabled", False)) and bool(xy_vorticity_spectrum_cfg.get("plot_enabled", True)) and not vorticity_spectrum_df.empty:
+            plot_range = _range_from_config(xy_vorticity_spectrum_cfg.get("plot_k_min"), xy_vorticity_spectrum_cfg.get("plot_k_max"))
+            with comparison_style_context("dark"):
+                fig, ax = plt.subplots(figsize=(7.4, 4.8), dpi=150)
+                plot_vorticity_spectrum(
+                    ax,
+                    vorticity_spectrum_df,
+                    title="2D vorticity spectrum",
+                    x_range=plot_range,
+                )
+
+                def _white_vorticity_spectrum(ax_white: Axes, df=vorticity_spectrum_df) -> None:
+                    plot_vorticity_spectrum(
+                        ax_white,
+                        df,
+                        title=None,
+                        x_range=plot_range,
+                    )
+
+                stem = velocity_vorticity_spectrum_artifact_stem(f"{dataset_id}_velocity_vorticity_spectrum", vector_cfg)
+                save_comparison_dual_pdf(fig, plot_dir, stem, white_plot_fn=_white_vorticity_spectrum)
+                plt.close(fig)
+
+        self.outputs["velocity_spectrum"] = result
         return result
 
     def _run_summary(self) -> dict[str, Any]:
@@ -3075,6 +3280,373 @@ def run_notebook_like(
     return runner
 
 
+def _reflect_into_bounds(values: np.ndarray, lower: np.ndarray, upper: np.ndarray) -> np.ndarray:
+    span = np.asarray(upper, dtype=float) - np.asarray(lower, dtype=float)
+    if np.any(span <= 0):
+        raise ValueError("upper bounds must be greater than lower bounds")
+    offset = np.mod(np.asarray(values, dtype=float) - lower, 2.0 * span)
+    reflected = np.where(offset > span, 2.0 * span - offset, offset)
+    return reflected + lower
+
+
+def _generate_synthetic_brownian_tracks(
+    *,
+    frame_count: int,
+    particle_count: int,
+    seed: int,
+    field_of_view_um: tuple[float, float, float],
+    drift_um_per_frame: tuple[float, float, float],
+    step_sigma_um: tuple[float, float, float],
+    margin_um: float,
+) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    fov = np.asarray(field_of_view_um, dtype=float)
+    lower = np.full(3, float(margin_um), dtype=float)
+    upper = fov - float(margin_um)
+    start_positions = rng.uniform(lower, upper, size=(int(particle_count), 3))
+
+    drift = np.asarray(drift_um_per_frame, dtype=float)
+    step_sigma = np.asarray(step_sigma_um, dtype=float)
+    positions = np.empty((int(frame_count), int(particle_count), 3), dtype=float)
+    positions[0] = start_positions
+
+    current = start_positions
+    for frame_index in range(1, int(frame_count)):
+        step = rng.normal(loc=drift, scale=step_sigma, size=(int(particle_count), 3))
+        current = _reflect_into_bounds(current + step, lower, upper)
+        positions[frame_index] = current
+
+    rows: list[dict[str, float | int]] = []
+    for frame_index in range(int(frame_count)):
+        for particle_index in range(int(particle_count)):
+            x_um, y_um, z_um = positions[frame_index, particle_index]
+            rows.append(
+                {
+                    "frame": int(frame_index),
+                    "particle": int(particle_index),
+                    "x_um": float(x_um),
+                    "y_um": float(y_um),
+                    "z_um": float(z_um),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def _generate_synthetic_motion_tracks(
+    *,
+    simulation_kind: str,
+    frame_count: int,
+    particle_count: int,
+    seed: int,
+    field_of_view_um: tuple[float, float, float],
+    drift_um_per_frame: tuple[float, float, float],
+    step_sigma_um: tuple[float, float, float],
+    margin_um: float,
+    radial_flow_um_per_frame: float,
+) -> pd.DataFrame:
+    kind = str(simulation_kind).strip().lower()
+    if kind not in {"brownian", "contractile", "extensile"}:
+        raise ValueError(f"Unknown synthetic motion kind: {simulation_kind!r}")
+
+    rng = np.random.default_rng(seed)
+    fov = np.asarray(field_of_view_um, dtype=float)
+    lower = np.full(3, float(margin_um), dtype=float)
+    upper = fov - float(margin_um)
+    center = 0.5 * (lower + upper)
+    start_positions = rng.uniform(lower, upper, size=(int(particle_count), 3))
+
+    drift = np.asarray(drift_um_per_frame, dtype=float)
+    step_sigma = np.asarray(step_sigma_um, dtype=float)
+    radial_flow = float(radial_flow_um_per_frame)
+    positions = np.empty((int(frame_count), int(particle_count), 3), dtype=float)
+    positions[0] = start_positions
+
+    current = start_positions
+    for frame_index in range(1, int(frame_count)):
+        step = rng.normal(loc=0.0, scale=step_sigma, size=(int(particle_count), 3))
+        if kind == "brownian":
+            step += drift
+        else:
+            radial_vector = current - center
+            radial_norm = np.linalg.norm(radial_vector, axis=1, keepdims=True)
+            radial_direction = np.divide(
+                radial_vector,
+                np.where(radial_norm > 0.0, radial_norm, 1.0),
+                out=np.zeros_like(radial_vector),
+                where=radial_norm > 0.0,
+            )
+            flow_sign = -1.0 if kind == "contractile" else 1.0
+            step += flow_sign * radial_flow * radial_direction + drift
+
+        current = _reflect_into_bounds(current + step, lower, upper)
+        positions[frame_index] = current
+
+    rows: list[dict[str, float | int]] = []
+    for frame_index in range(int(frame_count)):
+        for particle_index in range(int(particle_count)):
+            x_um, y_um, z_um = positions[frame_index, particle_index]
+            rows.append(
+                {
+                    "frame": int(frame_index),
+                    "particle": int(particle_index),
+                    "x_um": float(x_um),
+                    "y_um": float(y_um),
+                    "z_um": float(z_um),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def _average_tracks_over_frame_windows(tracks_df: pd.DataFrame, window_size: int) -> pd.DataFrame:
+    window_size = int(window_size)
+    if window_size <= 1 or tracks_df.empty:
+        return tracks_df.copy()
+
+    required_columns = {"frame", "particle", "x_um", "y_um", "z_um"}
+    missing_columns = required_columns.difference(tracks_df.columns)
+    if missing_columns:
+        raise ValueError(f"tracks_df is missing required columns for averaging: {sorted(missing_columns)}")
+
+    averaged = tracks_df.copy()
+    averaged["frame_window"] = averaged["frame"].astype(int) // window_size
+    averaged = (
+        averaged.groupby(["frame_window", "particle"], as_index=False)[["x_um", "y_um", "z_um"]]
+        .mean()
+        .sort_values(["frame_window", "particle"])
+        .reset_index(drop=True)
+    )
+    averaged = averaged.rename(columns={"frame_window": "frame"})
+    averaged["frame"] = averaged["frame"].astype(int)
+    return averaged
+
+
+def _run_synthetic_motion_vector_corr_test(
+    *,
+    simulation_kind: str,
+    dataset_id: str,
+    variation: str = "",
+    base_dir: str | Path = "data",
+    frame_count: int = 120,
+    particle_count: int = 48,
+    seed: int = 42,
+    average_window_frames: int = 1,
+) -> dict[str, Any]:
+    kind = str(simulation_kind).strip().lower()
+    if kind not in {"brownian", "contractile", "extensile"}:
+        raise ValueError(f"Unknown synthetic motion kind: {simulation_kind!r}")
+
+    average_window_frames = max(1, int(average_window_frames))
+    raw_frame_count = int(frame_count)
+    effective_frame_count = max(1, (raw_frame_count + average_window_frames - 1) // average_window_frames)
+
+    config = load_analysis_config(str(DEFAULT_CONFIG_PATH))
+    vector_cfg = dict(config.get("vector_corr", {}))
+    vector_cfg.update(
+        {
+            "enabled": True,
+            "exclude_velocity_outliers": False,
+            "multi_frame_average": False,
+            "tensor_time_series_enabled": True,
+            "plot_temporal_enabled": True,
+            "plot_spatial_enabled": True,
+            "plot_tensor_enabled": True,
+            "plot_tensor_pair_fits_enabled": True,
+            "plot_tensor_time_series_enabled": True,
+            "tensor_distance_mode": "xyz",
+            "spatial_frame_index": 0,
+            "tensor_frame_index": 0,
+            "spatial_nbins": 48,
+            "tensor_nbins": 36,
+            "temporal_max_lag_frames": min(60, max(1, int(effective_frame_count) - 1)),
+            "temporal_fit_lag_s_min": 0.2,
+            "temporal_fit_lag_s_max": 5.0,
+            "temporal_plot_max_points": 5000,
+            "tensor_time_series_sample_count": min(8, max(1, int(effective_frame_count))),
+        }
+    )
+    config["vector_corr"] = vector_cfg
+    spectrum_cfg = dict(config.get("velocity_spectrum", {}))
+    spectrum_cfg.update(
+        {
+            "enabled": True,
+            "grid_shape": [32, 32, 32],
+            "k_bins": 48,
+            "subtract_mean": True,
+        }
+    )
+    config["velocity_spectrum"] = spectrum_cfg
+    config["dataset"] = {
+        "base_dir": str(base_dir),
+        "dataset_id": dataset_id,
+        "variation": variation,
+    }
+    config.setdefault("runtime", {})
+    config["runtime"]["skip_existing"] = False
+    config["runtime"]["verbose"] = True
+
+    paths = prepare_output_dirs(dataset_id, variation=variation)
+    if kind == "brownian":
+        drift_um_per_frame = (0.015, -0.008, 0.003)
+        step_sigma_um = (0.22, 0.22, 0.11)
+        radial_flow_um_per_frame = 0.03
+    elif kind == "contractile":
+        drift_um_per_frame = (0.006, -0.003, 0.001)
+        step_sigma_um = (0.11, 0.11, 0.055)
+        radial_flow_um_per_frame = 0.11
+    else:
+        drift_um_per_frame = (0.006, -0.003, 0.001)
+        step_sigma_um = (0.11, 0.11, 0.055)
+        radial_flow_um_per_frame = 0.11
+
+    raw_tracks_df = _generate_synthetic_motion_tracks(
+        simulation_kind=kind,
+        frame_count=raw_frame_count,
+        particle_count=particle_count,
+        seed=seed,
+        field_of_view_um=(24.0, 24.0, 10.0),
+        drift_um_per_frame=drift_um_per_frame,
+        step_sigma_um=step_sigma_um,
+        margin_um=1.0,
+        radial_flow_um_per_frame=radial_flow_um_per_frame,
+    )
+
+    tracks_df = _average_tracks_over_frame_windows(raw_tracks_df, average_window_frames)
+    effective_frame_count = int(tracks_df["frame"].nunique()) if not tracks_df.empty else 0
+    effective_fps = 10.0 / float(average_window_frames)
+
+    tracks_path = Path(paths["derived_dir"]) / "beads_tracks.parquet"
+    raw_tracks_path = Path(paths["derived_dir"]) / "beads_tracks_raw.parquet"
+    raw_tracks_df.to_parquet(raw_tracks_path, index=False)
+    tracks_df.to_parquet(tracks_path, index=False)
+
+    state = {
+        "dataset_id": dataset_id,
+        "variation": variation,
+        "base_dir": str(base_dir),
+        "images": None,
+        "handle": None,
+        "raw_mask": None,
+        "dims": {"T": int(effective_frame_count), "C": 1, "Z": 40, "Y": 120, "X": 120},
+        "calibration": {
+            "px_per_micron": 4.0,
+            "px_per_micron_z": 4.0,
+            "fps": float(effective_fps),
+        },
+        "paths": paths,
+    }
+
+    velocity_df = compute_velocity_from_tracks(state, tracks_df, skip_existing=False)
+
+    runner = AnalysisNotebookRunner(config=config)
+    runner.state = state
+    runner.set_overwrite("vector_corr", True)
+    runner.set_feature("velocity_spectrum", compute=True, plot=True, overwrite=True)
+    result = runner.run_feature("vector_corr")
+    spectrum_result = runner.run_feature("velocity_spectrum")
+
+    temporal_df = _result_frame(result, "temporal_vector_corr_df", "temporal_df")
+    spatial_df = _result_frame(result, "spatial_vector_corr_df", "spatial_df")
+    tensor_df = _result_frame(result, "tensor_vector_corr_df", "tensor_df")
+    tensor_spherical_df = _result_frame(result, "tensor_spherical_vector_corr_df", "tensor_spherical_df")
+    tensor_time_series_df = _result_frame(result, "tensor_time_series_df")
+    tensor_spherical_time_series_df = _result_frame(result, "tensor_spherical_time_series_df")
+    spectrum_df = _result_frame(spectrum_result, "velocity_spectrum_df")
+    spectrum_frame_df = _result_frame(spectrum_result, "velocity_spectrum_frames_df")
+
+    print(f"Synthetic {kind} vector-corr test complete")
+    print(f"  raw tracks: {len(raw_tracks_df)} rows, {raw_tracks_df['particle'].nunique()} particles, {raw_tracks_df['frame'].nunique()} frames")
+    print(f"  averaged tracks: {len(tracks_df)} rows, {tracks_df['particle'].nunique()} particles, {tracks_df['frame'].nunique()} frames (window={average_window_frames})")
+    print(f"  velocity rows: {len(velocity_df)}")
+    print(f"  temporal rows: {len(temporal_df)}")
+    print(f"  spatial rows: {len(spatial_df)}")
+    print(f"  tensor rows: {len(tensor_df)}")
+    print(f"  spherical tensor rows: {len(tensor_spherical_df)}")
+    print(f"  tensor time-series rows: {len(tensor_time_series_df)}")
+    print(f"  spherical tensor time-series rows: {len(tensor_spherical_time_series_df)}")
+    print(f"  spectrum bins: {len(spectrum_df)}")
+    print(f"  spectrum frame rows: {len(spectrum_frame_df)}")
+    print(f"  derived dir: {paths['derived_dir']}")
+    print(f"  plots dir: {paths['plots_dir']}")
+
+    return {
+        "config": config,
+        "state": state,
+        "raw_tracks_df": raw_tracks_df,
+        "tracks_df": tracks_df,
+        "velocity_df": velocity_df,
+        "result": result,
+        "spectrum_result": spectrum_result,
+    }
+
+
+def run_synthetic_brownian_vector_corr_test(
+    *,
+    dataset_id: str = "synthetic_brownian_vector_corr",
+    variation: str = "",
+    base_dir: str | Path = "data",
+    frame_count: int = 120,
+    particle_count: int = 48,
+    seed: int = 42,
+    average_window_frames: int = 1,
+) -> dict[str, Any]:
+    return _run_synthetic_motion_vector_corr_test(
+        simulation_kind="brownian",
+        dataset_id=dataset_id,
+        variation=variation,
+        base_dir=base_dir,
+        frame_count=frame_count,
+        particle_count=particle_count,
+        seed=seed,
+        average_window_frames=average_window_frames,
+    )
+
+
+def run_synthetic_contractile_vector_corr_test(
+    *,
+    dataset_id: str = "synthetic_contractile_vector_corr",
+    variation: str = "",
+    base_dir: str | Path = "data",
+    frame_count: int = 120,
+    particle_count: int = 48,
+    seed: int = 42,
+    average_window_frames: int = 1,
+) -> dict[str, Any]:
+    return _run_synthetic_motion_vector_corr_test(
+        simulation_kind="contractile",
+        dataset_id=dataset_id,
+        variation=variation,
+        base_dir=base_dir,
+        frame_count=frame_count,
+        particle_count=particle_count,
+        seed=seed,
+        average_window_frames=average_window_frames,
+    )
+
+
+def run_synthetic_extensile_vector_corr_test(
+    *,
+    dataset_id: str = "synthetic_extensile_vector_corr",
+    variation: str = "",
+    base_dir: str | Path = "data",
+    frame_count: int = 120,
+    particle_count: int = 48,
+    seed: int = 42,
+    average_window_frames: int = 1,
+) -> dict[str, Any]:
+    return _run_synthetic_motion_vector_corr_test(
+        simulation_kind="extensile",
+        dataset_id=dataset_id,
+        variation=variation,
+        base_dir=base_dir,
+        frame_count=frame_count,
+        particle_count=particle_count,
+        seed=seed,
+        average_window_frames=average_window_frames,
+    )
+
+
 def _parse_feature_switch_overrides(values: list[str]) -> dict[str, dict[str, bool]]:
     parsed: dict[str, dict[str, bool]] = {}
     for value in values:
@@ -3090,7 +3662,10 @@ def _parse_feature_switch_overrides(values: list[str]) -> dict[str, dict[str, bo
             if "=" not in setting:
                 raise ValueError(f"Invalid switch setting: {setting!r}")
             key, raw_value = setting.split("=", 1)
-            parsed[feature_name][key.strip()] = raw_value.strip().lower() in {"1", "true", "yes", "on"}
+            key_name = key.strip().lower()
+            if key_name not in {"compute", "plot"}:
+                continue
+            parsed[feature_name][key_name] = raw_value.strip().lower() in {"1", "true", "yes", "on"}
     return parsed
 
 
@@ -3131,6 +3706,16 @@ def _apply_notebook_commands(
 def main(argv: list[str] | None = None) -> Any:
     parser = argparse.ArgumentParser(description="Notebook-like orchestration for analysis_unified")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    synthetic_group = parser.add_mutually_exclusive_group()
+    synthetic_group.add_argument("--synthetic-brownian", action="store_true")
+    synthetic_group.add_argument("--synthetic-contractile", action="store_true")
+    synthetic_group.add_argument("--synthetic-extensile", action="store_true")
+    parser.add_argument("--synthetic-dataset-id", type=str, default=None)
+    parser.add_argument("--synthetic-frames", type=int, default=120)
+    parser.add_argument("--synthetic-particles", type=int, default=48)
+    parser.add_argument("--synthetic-seed", type=int, default=42)
+    parser.add_argument("--synthetic-average-window", type=int, default=1)
+    parser.add_argument("--synthetic-base-dir", type=Path, default=Path("data"))
     parser.add_argument("--dataset-id", type=str, default=None)
     parser.add_argument("--dataset-ids", nargs="*", default=[])
     parser.add_argument("--variation", type=str, default=None)
@@ -3152,6 +3737,52 @@ def main(argv: list[str] | None = None) -> Any:
     parser.add_argument("--base-dir", type=Path, default=None)
     parser.add_argument("--notebook-base-dir", type=Path, default=None)
     args = parser.parse_args(argv)
+
+    synthetic_kind = None
+    if args.synthetic_brownian:
+        synthetic_kind = "brownian"
+    elif args.synthetic_contractile:
+        synthetic_kind = "contractile"
+    elif args.synthetic_extensile:
+        synthetic_kind = "extensile"
+
+    if synthetic_kind is not None:
+        default_dataset_ids = {
+            "brownian": "synthetic_brownian_vector_corr",
+            "contractile": "synthetic_contractile_vector_corr",
+            "extensile": "synthetic_extensile_vector_corr",
+        }
+        dataset_id = str(args.synthetic_dataset_id).strip() if args.synthetic_dataset_id is not None else ""
+        dataset_id = dataset_id or default_dataset_ids[synthetic_kind]
+        if synthetic_kind == "brownian":
+            return run_synthetic_brownian_vector_corr_test(
+                dataset_id=dataset_id,
+                variation=str(args.variation).strip() if args.variation is not None else "",
+                base_dir=args.synthetic_base_dir,
+                frame_count=int(args.synthetic_frames),
+                particle_count=int(args.synthetic_particles),
+                seed=int(args.synthetic_seed),
+                average_window_frames=int(args.synthetic_average_window),
+            )
+        if synthetic_kind == "contractile":
+            return run_synthetic_contractile_vector_corr_test(
+                dataset_id=dataset_id,
+                variation=str(args.variation).strip() if args.variation is not None else "",
+                base_dir=args.synthetic_base_dir,
+                frame_count=int(args.synthetic_frames),
+                particle_count=int(args.synthetic_particles),
+                seed=int(args.synthetic_seed),
+                average_window_frames=int(args.synthetic_average_window),
+            )
+        return run_synthetic_extensile_vector_corr_test(
+            dataset_id=dataset_id,
+            variation=str(args.variation).strip() if args.variation is not None else "",
+            base_dir=args.synthetic_base_dir,
+            frame_count=int(args.synthetic_frames),
+            particle_count=int(args.synthetic_particles),
+            seed=int(args.synthetic_seed),
+            average_window_frames=int(args.synthetic_average_window),
+        )
 
     config = load_analysis_config(str(args.config))
     comparison_cfg = config.get("comparison", {}) if isinstance(config.get("comparison", {}), dict) else {}

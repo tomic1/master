@@ -8,6 +8,7 @@ from .autocorr_2d import compute_radial_2d_single, compute_sampled_2d
 from .autocorr_3d import compute_sampled_3d, compute_single_frame_3d
 from .beads_track import detect_and_link_beads, preview_bead_detection
 from .beads_velocity import compute_angular_speed_xy, compute_velocity_from_tracks
+from .velocity_spectrum import run_velocity_spectrum_core as _run_velocity_spectrum_core
 from .vector_correlation import run_vector_correlation_core as _run_vector_correlation_core
 from .image_correlation import compute_raw_time_image_correlation, fit_time_image_correlation
 from .io_dataset import load_dataset_state
@@ -130,10 +131,19 @@ def run_vector_correlation_core(
     return _run_vector_correlation_core(config, state=state, overrides=overrides)
 
 
+def run_velocity_spectrum_core(
+    config: Dict[str, Any],
+    state: Dict[str, Any] | None = None,
+    overrides: Dict[str, Any] | None = None,
+) -> Dict[str, pd.DataFrame]:
+    return _run_velocity_spectrum_core(config, state=state, overrides=overrides)
+
+
 def run_core_pipeline(config: Dict[str, Any], overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
     bead_out = run_bead_core(config, overrides=overrides)
     autocorr_out = run_autocorr_core(config, state=bead_out["state"], overrides=overrides)
     vector_corr_out = run_vector_correlation_core(config, state=bead_out["state"], overrides=overrides)
+    velocity_spectrum_out = run_velocity_spectrum_core(config, state=bead_out["state"], overrides=overrides)
     image_corr_out = run_image_correlation_core(config, state=bead_out["state"], overrides=overrides)
     image_corr_fit_out = run_image_correlation_fit_core(
         config,
@@ -145,6 +155,7 @@ def run_core_pipeline(config: Dict[str, Any], overrides: Dict[str, Any] | None =
     merged = dict(bead_out)
     merged.update(autocorr_out)
     merged.update(vector_corr_out)
+    merged.update(velocity_spectrum_out)
     merged.update(image_corr_out)
     merged.update(image_corr_fit_out)
     return merged

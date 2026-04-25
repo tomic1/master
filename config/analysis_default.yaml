@@ -10,7 +10,8 @@ dataset:
   load_mask_channel: true
 
 beads:
-  enabled: true
+  enabled: false
+  plot_preview_enabled: true
   channel_to_use: 1
   min_size_voxels: 5
   max_bbox_ratio: 6.0
@@ -34,9 +35,9 @@ beads:
   origin_y_um: null
 
 autocorr:
-  enabled: true
+  enabled: false
   single_frame_3d_enabled: true
-  sampled_3d_enabled: false
+  sampled_3d_enabled: true
   sampled_2d_enabled: false
   radial_2d_enabled: false
   channel_3d: 0
@@ -58,8 +59,15 @@ autocorr:
   fit_r_um_max: null
 
 vector_corr:
-  enabled: true
-  use_unit_vectors: true
+  enabled: false
+  use_unit_vectors: false
+  plot_temporal_enabled: true
+  plot_spatial_enabled: true
+  plot_tensor_enabled: true
+  plot_tensor_parts:
+    - full
+    - symmetric
+    - antisymmetric
   velocity_source: drift_corrected
   exclude_velocity_outliers: true
   velocity_outlier_method: westerweel_scarano
@@ -79,7 +87,7 @@ vector_corr:
   spatial_max_radius_um: null
   spatial_plot_distance_um_min: null
   spatial_plot_distance_um_max: null
-  tensor_enabled: true
+  tensor_enabled: false
   tensor_bases:
     - cartesian
     - spherical
@@ -100,9 +108,44 @@ vector_corr:
   tensor_fit_distance_um_min: 5
   tensor_fit_distance_um_max: 200
   tensor_fit_min_points: 4
-  tensor_time_series_enabled: true
+  plot_tensor_pair_fits_enabled: true
+  plot_tensor_time_series_enabled: true
+  tensor_time_series_enabled: false
   tensor_time_series_sample_count: 5
   parallel_workers: 0
+
+velocity_spectrum:
+  enabled: true
+  velocity_source: drift_corrected
+  grid_shape: [32, 32, 32]
+  box_padding_fraction: 0.05
+  k_bins: 64
+  apply_window: true
+  window_function: hann
+  plot_smoothing_bins: 5
+  subtract_mean: false # is already done with drift correction
+  plot_enabled: false
+  plot_k_min: null
+  plot_k_max: null
+  xy_vorticity:
+    enabled: false
+    frame: middle
+    grid_shape: [64, 64]
+    box_padding_fraction: 0.05
+    interpolation_method: linear
+    quiver_stride: 3
+    quiver_scale: null
+    plot_enabled: true
+    colormap: RdBu_r
+    spectrum:
+      enabled: true
+      k_bins: 64
+      subtract_mean: false
+      apply_window: true
+      window_function: hann
+      plot_enabled: true
+      plot_k_min: null
+      plot_k_max: null
 
 image_corr:
   enabled: false
@@ -119,12 +162,30 @@ runtime:
 
 comparison:
   enabled: true
-  selected: prc
+  selected: atp
   output_root: plots/comparisons
   autocorr_sample_mode: mean  # mean | frame
   autocorr_sample_frame: 0
-  apply_notebook_feature_commands_to_single_datasets: false
-  drift_velocity_over_time_enabled: true
+  apply_notebook_feature_commands_to_single_datasets: true
+  plot_velocity_over_time_enabled: false
+  drift_velocity_over_time_enabled: false
+  plot_mean_speed_summary_enabled: false
+  vector_corr:
+    plot_temporal_enabled: false
+    plot_spatial_enabled: false
+    plot_tensor_enabled: false
+    plot_tensor_parts:
+      - full
+      - symmetric
+      - antisymmetric
+    plot_tensor_pair_fits_enabled: false
+    plot_tensor_time_series_enabled: false
+  velocity_spectrum:
+    plot_enabled: true
+  vorticity_spectrum:
+    plot_enabled: true
+    plot_k_min: null
+    plot_k_max: null
 
   presets:
     prc:
